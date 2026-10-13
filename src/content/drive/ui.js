@@ -32,7 +32,6 @@
         videoMenu: 'psd-protected-video-menuitem'
     };
 
-    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     const sendAction = (action, data = {}) => {
         try {
             chrome.runtime.sendMessage({ action, ...data }).catch?.(() => {});
@@ -307,6 +306,11 @@
             if (detail) detail.textContent = '';
         };
     }
+    const SCROLL_MESSAGE = `<div id="psd-scroll-dim-msg" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:min(420px,calc(100vw - 48px));text-align:center;pointer-events:none;user-select:none;">
+        <div style="font:500 17px/1.35 'Google Sans',Roboto,Arial,sans-serif;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,.7);margin-bottom:8px;">Stay on this tab until the export finishes</div>
+        <div style="font:400 13px/1.4 Roboto,Arial,sans-serif;color:rgba(255,255,255,.72);text-shadow:0 1px 3px rgba(0,0,0,.6);">Leaving this tab may interrupt page capture</div>
+    </div>`;
+
     function createInPageOverlay() {
         const host = document.body || document.documentElement;
         let dim = document.getElementById('psd-scroll-dim');
@@ -315,9 +319,7 @@
             dim.id = 'psd-scroll-dim';
             dim.setAttribute('aria-hidden', 'true');
             dim.style.cssText = 'position:fixed;inset:0;z-index:2147483645;background:rgba(0,0,0,.80);pointer-events:auto;display:none;';
-            dim.innerHTML = '<div id="psd-scroll-dim-msg" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:min(420px,calc(100vw - 48px));text-align:center;pointer-events:none;user-select:none;">' +
-                '<div style="font:500 17px/1.35 \'Google Sans\',Roboto,Arial,sans-serif;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,.7);margin-bottom:8px;">Stay on this tab until the export finishes</div>' +
-                '<div style="font:400 13px/1.4 Roboto,Arial,sans-serif;color:rgba(255,255,255,.72);text-shadow:0 1px 3px rgba(0,0,0,.6);">Leaving this tab may interrupt page capture</div></div>';
+            dim.innerHTML = SCROLL_MESSAGE;
             host.appendChild(dim);
         }
 
@@ -335,9 +337,7 @@
         const dim = document.getElementById('psd-scroll-dim');
         if (!dim) return;
         if (show && !dim.querySelector('#psd-scroll-dim-msg')) {
-            dim.innerHTML = '<div id="psd-scroll-dim-msg" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:min(420px,calc(100vw - 48px));text-align:center;pointer-events:none;user-select:none;">' +
-                '<div style="font:500 17px/1.35 \'Google Sans\',Roboto,Arial,sans-serif;color:#fff;text-shadow:0 1px 4px rgba(0,0,0,.7);margin-bottom:8px;">Stay on this tab until the export finishes</div>' +
-                '<div style="font:400 13px/1.4 Roboto,Arial,sans-serif;color:rgba(255,255,255,.72);text-shadow:0 1px 3px rgba(0,0,0,.6);">Leaving this tab may interrupt page capture</div></div>';
+            dim.innerHTML = SCROLL_MESSAGE;
         }
         dim.style.display = show ? 'block' : 'none';
     }
@@ -421,7 +421,6 @@
         setInterval(scheduleScan, 1000);
     }
 
-    app.sleep = sleep;
     app.sendAction = sendAction;
     app.isDrivePage = isDrivePage;
     app.ui = {

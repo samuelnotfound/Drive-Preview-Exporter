@@ -78,10 +78,6 @@
         return height ? `${height}p` : (width ? `${width}px` : 'Video');
     };
 
-    // Scan page-blocker UI was disabled; keep no-op hooks so call sites stay simple.
-    function showPageBlocker() {}
-    function hidePageBlocker() {}
-
 
     function installInteractionShield() {
         if (window.__PSD_QUALITY_PICKER_INTERACTION_SHIELD) return;
@@ -557,7 +553,6 @@
 
         video.operation = 'idle';
         video.restorePickerOnFileMenuOpen = !shouldClearSnapshot;
-        hidePageBlocker();
 
         if (shouldClearSnapshot) void clearSnapshot();
         app.video?.updateMenuState();
@@ -781,7 +776,6 @@
         if (root) root.style.display = 'none';
 
         video.operation = 'idle';
-        hidePageBlocker();
         app.video?.updateMenuState();
     }
 
@@ -789,13 +783,7 @@
         video.formats = formats || { video: [], audio: [], progressive: [] };
         video.pickerFormats = core.cloneFormats(video.formats);
         if (Array.isArray(menuOptions) && menuOptions.length) {
-            video.qualityMenuOptions = menuOptions
-                .map(option => ({
-                    height: Number(option?.height || 0),
-                    label: String(option?.text || option?.label || '').trim(),
-                    text: String(option?.text || option?.label || '').trim()
-                }))
-                .filter(option => option.height > 0);
+            video.qualityMenuOptions = core.normalizeQualityOptions(menuOptions);
         } else if (!Array.isArray(video.qualityMenuOptions)) {
             video.qualityMenuOptions = [];
         }
@@ -844,7 +832,6 @@
         // Always keep restore-on-open so a successful scan is never discarded
         // just because the immediate mount dance timed out.
         video.restorePickerOnFileMenuOpen = true;
-        hidePageBlocker();
         updatePickerState();
         if (message) status.textContent = message;
         app.video?.updateMenuState();
@@ -868,8 +855,7 @@
                 status.textContent = message
                     || 'Qualities detected. Open the File menu to choose a quality.';
             }
-            hidePageBlocker();
-            app.video?.updateMenuState();
+                app.video?.updateMenuState();
             return hasFormats;
         }
     }
@@ -939,7 +925,6 @@
         video.restorePickerOnFileMenuOpen = true;
         video.operation = 'staging';
         try { app.ui.closeDriveFileMenu(); } catch (_) {}
-        hidePageBlocker();
 
         // Persist snapshot so cancel/reopen can restore the picker without re-probing.
         void core.saveQualitySnapshot?.();
@@ -1042,9 +1027,25 @@
         }
 
         beginVideoDownload(root, response);
+        // The overlay is now bound to this exact job, before its progress,
+        // finalization, or completion messages can arrive.
+        let activation;
+        try {
+            activation = await core.sendRuntime({
+                action: 'activateVideoStage',
+                jobId: response.jobId
+            });
+        } catch (error) {
+            activation = { success: false, error: error?.message || String(error) };
+        }
+        if (!activation?.success && videoOverlay.getJobId?.() === response.jobId) {
+            videoOverlay.clearJob();
+            videoOverlay.update({ stage: 'error', message: activation?.error || 'Could not start downloader.' });
+            document.dispatchEvent(new CustomEvent('psd-video-stage-local-end'));
+            try { void core.sendRuntime({ type: 'videoStageCancel', jobId: response.jobId }); } catch (_) {}
+        }
         } finally {
             video._downloadGuard = false;
-            try { hidePageBlocker(); } catch (_) {}
         }
     }
 
@@ -1131,8 +1132,6 @@
         init,
         getVisibleDriveMenu,
         waitForDriveFileMenuClosed,
-        showPageBlocker,
-        hidePageBlocker,
         resetScanUI,
         show: showQualityPicker,
         download: downloadFromPicker,

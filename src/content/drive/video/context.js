@@ -35,6 +35,23 @@
         };
     }
 
+    function normalizeQualityOptions(options = []) {
+        return options.map(option => {
+            const label = String(option?.text || option?.label || '').trim();
+            return { height: Number(option?.height) || 0, label, text: label };
+        }).filter(option => option.height > 0);
+    }
+
+    function makeLabelOnlyFormats(options = []) {
+        return options.map(({ height, label, text }) => {
+            const name = label || text || `${height}p`;
+            return {
+                id: `label:${height}`, height, qualityHeight: height,
+                probeQuality: name, menuLabel: name, labelOnly: true, url: ''
+            };
+        });
+    }
+
     async function saveQualitySnapshot() {
         const fileId = String(video.fileId || '').trim();
         const menuOptions = Array.isArray(video.qualityMenuOptions) ? video.qualityMenuOptions : [];
@@ -44,19 +61,7 @@
 
         const formats = video.pickerFormats
             ? cloneFormats(video.pickerFormats)
-            : {
-                video: menuOptions.map(o => ({
-                    id: `label:${o.height}`,
-                    height: Number(o.height) || 0,
-                    qualityHeight: Number(o.height) || 0,
-                    probeQuality: o.label || o.text || `${o.height}p`,
-                    menuLabel: o.label || o.text || `${o.height}p`,
-                    labelOnly: true,
-                    url: ''
-                })),
-                audio: [],
-                progressive: []
-            };
+            : { video: makeLabelOnlyFormats(menuOptions), audio: [], progressive: [] };
 
         try {
             await sendRuntime({
@@ -66,11 +71,7 @@
                     fileId,
                     viewerSessionId: String(video.viewerSessionId || ''),
                     formats,
-                    menuOptions: menuOptions.map(o => ({
-                        height: Number(o.height) || 0,
-                        label: String(o.label || o.text || '').trim(),
-                        text: String(o.text || o.label || '').trim()
-                    })),
+                    menuOptions: normalizeQualityOptions(menuOptions),
                     savedAt: Date.now()
                 }
             });
@@ -83,15 +84,7 @@
         if (Array.isArray(video.qualityMenuOptions) && video.qualityMenuOptions.length) {
             if (!video.pickerFormats) {
                 video.pickerFormats = {
-                    video: video.qualityMenuOptions.map(o => ({
-                        id: `label:${o.height}`,
-                        height: Number(o.height) || 0,
-                        qualityHeight: Number(o.height) || 0,
-                        probeQuality: o.label || o.text || `${o.height}p`,
-                        menuLabel: o.label || o.text || `${o.height}p`,
-                        labelOnly: true,
-                        url: ''
-                    })),
+                    video: makeLabelOnlyFormats(video.qualityMenuOptions),
                     audio: (video.formats?.audio || []).slice(0, 1),
                     progressive: []
                 };
@@ -108,26 +101,11 @@
             // Only restore label rows (no signed URLs) — URLs must be re-captured on download.
             const menu = Array.isArray(snap.menuOptions) ? snap.menuOptions : [];
             if (menu.length) {
-                video.qualityMenuOptions = menu
-                    .map(o => ({
-                        height: Number(o.height) || 0,
-                        label: String(o.label || o.text || '').trim(),
-                        text: String(o.text || o.label || '').trim()
-                    }))
-                    .filter(o => o.height > 0);
+                video.qualityMenuOptions = normalizeQualityOptions(menu);
             }
             const labelFormats = {
-                video: (video.qualityMenuOptions || []).map(o => ({
-                    id: `label:${o.height}`,
-                    height: o.height,
-                    qualityHeight: o.height,
-                    probeQuality: o.label || `${o.height}p`,
-                    menuLabel: o.label || `${o.height}p`,
-                    labelOnly: true,
-                    url: ''
-                })),
-                audio: [],
-                progressive: []
+                video: makeLabelOnlyFormats(video.qualityMenuOptions),
+                audio: [], progressive: []
             };
             video.pickerFormats = labelFormats;
             return !!(video.qualityMenuOptions?.length);
@@ -304,6 +282,8 @@
         sendRuntime,
         hasUsableFormats,
         cloneFormats,
+        normalizeQualityOptions,
+        makeLabelOnlyFormats,
         saveQualitySnapshot,
         restoreQualitySnapshot,
         isVideoViewerOpen,

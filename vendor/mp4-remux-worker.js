@@ -1,109 +1,56 @@
-/**
- * Mux worker: merge video + audio MP4 streams with mp4-remux (stream copy).
- * Protocol: { type: 'mux', video: Blob, audio: Blob }
- * Out: { type: 'status' | 'ffmpeg-progress' | 'done' | 'error', ... }
- */
+/** Merge disk-backed source Files into a disk-backed MP4 without creating a final-size Blob. */
 importScripts('mp4-remux.iife.js');
 
-const remux = self.mp4Remux;
-
-function postStatus(message) {
-  postMessage({ type: 'status', message: String(message) });
+function trackedStream(file, onBytes) {
+    const reader = file.stream().getReader();
+    let received = 0;
+    return new ReadableStream({
+        async pull(controller) {
+            const { done, value } = await reader.read();
+            if (done) { controller.close(); return; }
+            received += value.byteLength;
+            onBytes(received);
+            controller.enqueue(value);
+        },
+        cancel() { return reader.cancel(); }
+    });
 }
 
-function postProgress(progress) {
-  const value = Number(progress);
-  if (!Number.isFinite(value)) return;
-  postMessage({
-    type: 'ffmpeg-progress',
-    progress: Math.max(0, Math.min(1, value)),
-    time: 0,
-    duration: 0,
-    frame: 0
-  });
-}
+self.onmessage = async ({ data }) => {
+    if (data?.type !== 'mux') return;
+    let writer;
+    try {
+        const { video, audio, jobId } = data;
+        if (!(video instanceof Blob) || !(audio instanceof Blob)) {
+            throw new Error('Both video and audio files are required for merging.');
+        }
+        const root = await navigator.storage.getDirectory();
+        const workspace = await root.getDirectoryHandle('drive-preview-exporter-temp');
+        const jobDirectory = await workspace.getDirectoryHandle(jobId.replace(/[^a-zA-Z0-9_-]/g, '_'));
+        const output = await jobDirectory.getFileHandle('output.mp4', { create: true });
+        writer = await output.createWritable({ keepExistingData: false });
 
-function trackedStream(blob, onBytes) {
-  const reader = blob.stream().getReader();
-  let seen = 0;
-  return new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) {
-        controller.close();
-        return;
-      }
-      seen += value.byteLength;
-      onBytes(seen, blob.size);
-      controller.enqueue(value);
-    },
-    cancel() {
-      return reader.cancel();
+        let videoRead = 0, audioRead = 0, lastProgress = 0;
+        const total = video.size + audio.size;
+        const report = () => {
+            if (Date.now() - lastProgress < 350) return;
+            lastProgress = Date.now();
+            postMessage({ type: 'ffmpeg-progress', progress: total ? (videoRead + audioRead) / total : 0 });
+        };
+        const combined = await self.mp4Remux(
+            trackedStream(video, n => { videoRead = n; report(); }),
+            trackedStream(audio, n => { audioRead = n; report(); })
+        );
+        if (!combined?.getReader) throw new Error('MP4 merger did not return a stream.');
+        // FileSystemWritableFileStream accepts Uint8Arrays and applies write backpressure.
+        await combined.pipeTo(writer);
+        writer = null;
+        const file = await output.getFile();
+        if (!file.size) throw new Error('The merged MP4 was empty.');
+        postMessage({ type: 'ffmpeg-progress', progress: 1 });
+        postMessage({ type: 'done', size: file.size });
+    } catch (error) {
+        try { await writer?.abort(); } catch (_) {}
+        postMessage({ type: 'error', message: error?.message || String(error) });
     }
-  });
-}
-
-async function streamToArrayBuffer(stream) {
-  const reader = stream.getReader();
-  const chunks = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    total += value.byteLength;
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out.buffer;
-}
-
-self.onmessage = async event => {
-  const data = event.data || {};
-  if (data.type !== 'mux') return;
-
-  try {
-    const videoBlob = data.video;
-    const audioBlob = data.audio;
-    if (!(videoBlob instanceof Blob) || !(audioBlob instanceof Blob)) {
-      throw new Error('Mux requires video and audio Blobs.');
-    }
-
-    postStatus('Processing video…');
-    const totalBytes = videoBlob.size + audioBlob.size;
-    let videoRead = 0;
-    let audioRead = 0;
-    const report = () => {
-      if (totalBytes > 0) postProgress((videoRead + audioRead) / totalBytes);
-    };
-
-    const videoStream = trackedStream(videoBlob, (n) => {
-      videoRead = n;
-      report();
-    });
-    const audioStream = trackedStream(audioBlob, (n) => {
-      audioRead = n;
-      report();
-    });
-
-    const result = await remux(videoStream, audioStream);
-    const buffer =
-      result instanceof ArrayBuffer
-        ? result
-        : result?.buffer instanceof ArrayBuffer
-          ? result.buffer
-          : await streamToArrayBuffer(result);
-
-    postProgress(1);
-    postMessage({ type: 'done', buffer }, [buffer]);
-  } catch (error) {
-    postMessage({
-      type: 'error',
-      message: error?.message || String(error)
-    });
-  }
 };

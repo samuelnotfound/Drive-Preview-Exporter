@@ -1,6 +1,5 @@
 (() => {
     const NS = 'GDriveVideoOverlay';
-    const CIRCUMFERENCE = 106.81415022205297;
     const DOWNLOAD_WEIGHT = 1;
     /** No new bytes for this long during download → offer the Restart button. */
     const STALL_MS = 6000;
@@ -15,8 +14,14 @@
         stalled: false,
         note: '',
         video: { received: 0, total: 0 },
-        audio: { received: 0, total: 0 }
+        audio: { received: 0, total: 0 },
+        chunks: { video: newChunkState(), audio: newChunkState() }
     };
+    /** Each stream keeps the exact positions of finished and active chunks. */
+    function newChunkState() {
+        return { enabled: false, total: 0, chunkSize: 0, workers: 0,
+            mode: 'checking', reason: '', completed: new Set(), active: new Map() };
+    }
     const OVERLAY_HTML = `
       <style>
 #psd-video-progress-overlay {
@@ -76,21 +81,16 @@
     display: block;
 }
 #psd-video-progress-spinner svg {
-    transform: rotate(-90deg);
+    width: 32px;
+    height: 32px;
+    display: block;
 }
-#psd-video-progress-spinner .bg {
-    fill: none;
-    stroke: #444746;
-    stroke-width: 3.5;
-}
-#psd-video-progress-spinner .ring {
+#psd-video-progress-spinner .download-icon {
     fill: none;
     stroke: #a8c7fa;
-    stroke-width: 3.5;
+    stroke-width: 1.8;
     stroke-linecap: round;
-    stroke-dasharray: ${CIRCUMFERENCE};
-    stroke-dashoffset: ${CIRCUMFERENCE};
-    transition: stroke-dashoffset .16s linear;
+    stroke-linejoin: round;
 }
 #psd-video-progress-check {
     display: none;
@@ -149,6 +149,53 @@
 #psd-video-progress-detail .psd-stream-line {
     display: block;
 }
+#psd-video-progress-tracks { margin-top: 16px; }
+.psd-video-track-row + .psd-video-track-row { margin-top: 12px; }
+.psd-video-track-heading {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 6px;
+    font-size: 11px;
+    color: #c4c7c5;
+    font-variant-numeric: tabular-nums;
+}
+.psd-video-track-heading span:first-child { letter-spacing: .4px; }
+.psd-video-track-connections { color: #9da29f; font-size: 10px; margin-left: 8px; letter-spacing: 0; }
+.psd-video-track {
+    position: relative;
+    height: 9px;
+    background: #454746;
+    border-radius: 4px;
+    overflow: hidden;
+}
+.psd-video-track-chunk {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    box-sizing: border-box;
+    pointer-events: auto;
+}
+.psd-video-track-chunk.complete { background: #a8c7fa; }
+.psd-video-track-chunk.active {
+    background: rgba(168,199,250,.20);
+}
+.psd-video-track-chunk .filling {
+    display: block;
+    height: 100%;
+    background: #a8c7fa;
+}
+#psd-video-overall-track { display: none; margin-top: 16px; }
+#psd-video-overall-fill {
+    width: 0;
+    height: 100%;
+    background: #a8c7fa;
+    transition: width .16s linear;
+}
+#psd-video-progress-overlay:not(.downloading) #psd-video-progress-tracks { display: none; }
+#psd-video-progress-overlay:not(.downloading) #psd-video-overall-track { display: block; }
+/* A finished, cancelled, or handed-off download needs no progress bar. */
+#psd-video-progress-overlay:is(.started, .completed, .cancelled, .error) #psd-video-overall-track { display: none; }
 #psd-video-progress-cancel,         #psd-video-progress-close {
     border: 0;
     box-sizing: border-box;
@@ -246,8 +293,7 @@
           <div id="psd-video-progress-head">
             <div id="psd-video-progress-spinner" aria-hidden="true">
               <svg viewBox="0 0 40 40">
-                <circle class="bg" cx="20" cy="20" r="17"></circle>
-                <circle id="psd-video-progress-ring" class="ring" cx="20" cy="20" r="17"></circle>
+                <path class="download-icon" d="M20 7v19m-7-7 7 7 7-7M9 30v4h22v-4"/>
               </svg>
             </div>
             <div id="psd-video-progress-check" aria-hidden="true">
@@ -271,6 +317,17 @@
             <button id="psd-video-progress-restart" type="button">Restart</button>
             <button id="psd-video-progress-close" type="button" aria-label="Close">×</button>
           </div>
+          <div id="psd-video-progress-tracks">
+            <div class="psd-video-track-row" id="psd-video-row-video">
+              <div class="psd-video-track-heading"><span>VIDEO <span class="psd-video-track-connections" id="psd-video-connections-video">checking…</span></span><span id="psd-video-percent-video">0%</span></div>
+              <div class="psd-video-track" id="psd-video-track-video" role="progressbar" aria-label="Video download" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+            </div>
+            <div class="psd-video-track-row" id="psd-video-row-audio" style="display:none">
+              <div class="psd-video-track-heading"><span>AUDIO <span class="psd-video-track-connections" id="psd-video-connections-audio">checking…</span></span><span id="psd-video-percent-audio">0%</span></div>
+              <div class="psd-video-track" id="psd-video-track-audio" role="progressbar" aria-label="Audio download" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+            </div>
+          </div>
+          <div class="psd-video-track" id="psd-video-overall-track" role="progressbar" aria-label="Export progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="psd-video-overall-fill"></div></div>
         </div>
       </div>`;
 
@@ -302,12 +359,6 @@
             } catch (_) {
                 // The page can disappear while a download is being cancelled.
             }
-            setTimeout(() => {
-                const currentRoot = document.getElementById(
-                    "psd-video-progress-overlay"
-                );
-                if (currentRoot) currentRoot.style.display = "none";
-            }, 700);
         });
         closeButton.addEventListener("click", () => {
             const jobId = state.jobId;
@@ -446,15 +497,130 @@
         const combinedDownloaded = Math.min(combinedSize, combinedReceived());
         return Math.max(0, Math.min(1, combinedDownloaded / combinedSize));
     }
-    function setRing(overallPercent) {
+    /** Position a chunk at its *file offset*, not in order of completion. */
+    function positionChunk(element, start, length, total) {
+        element.style.left = `${100 * start / total}%`;
+        element.style.width = `${100 * length / total}%`;
+    }
+    function renderChunkTrack(label) {
+        const root = document.getElementById('psd-video-progress-overlay');
+        if (!root) return;
+        const stream = state[label];
+        const chunks = state.chunks[label];
+        const track = root.querySelector(`#psd-video-track-${label}`);
+        const row = root.querySelector(`#psd-video-row-${label}`);
+        const percentLabel = root.querySelector(`#psd-video-percent-${label}`);
+        if (!track || !row) return;
+        row.style.display = label === 'video' || stream.total || stream.received || chunks.enabled ? 'block' : 'none';
+        // Use the size verified by the range probe. The URL's original clen
+        // hint can be wrong, making four audio chunks look like one tiny bar.
+        const total = chunks.enabled ? chunks.total : Math.max(stream.total, chunks.total);
+        const percent = total ? Math.min(100, Math.floor(100 * stream.received / total)) : 0;
+        if (percentLabel) percentLabel.textContent = `${percent}%`;
+        const connectionsLabel = root.querySelector(`#psd-video-connections-${label}`);
+        if (connectionsLabel) {
+            connectionsLabel.textContent = chunks.mode === 'parallel'
+                ? `${chunks.workers} connections`
+                : chunks.mode === 'single' ? '1 connection · no ranges' : 'checking…';
+            connectionsLabel.title = chunks.reason || '';
+        }
+        track.setAttribute('aria-valuenow', String(percent));
+        track.replaceChildren();
+        if (!total) return;
+
+        // Unknown or non-range servers use an ordinary continuous bar.
+        if (!chunks.enabled || !chunks.chunkSize) {
+            const fill = document.createElement('div');
+            fill.className = 'psd-video-track-chunk complete';
+            positionChunk(fill, 0, Math.min(total, stream.received), total);
+            track.appendChild(fill);
+            return;
+        }
+        const elements = [];
+        // Adjacent finished chunks make one uninterrupted blue region. This
+        // avoids a line between every 4 MiB block, especially on large files.
+        const sorted = [...chunks.completed].sort((a, b) => a - b);
+        const addCompletedRun = (first, last) => {
+            const start = first * chunks.chunkSize;
+            if (start >= total) return;
+            const end = Math.min((last + 1) * chunks.chunkSize, total);
+            const element = document.createElement('div');
+            element.className = 'psd-video-track-chunk complete';
+            element.title = `chunks ${first + 1}–${last + 1}: ${formatBytes(start)}–${formatBytes(end)} · finished`;
+            positionChunk(element, start, end - start, total);
+            elements.push(element);
+        };
+        let first = -1;
+        let last = -1;
+        for (const index of sorted) {
+            if (index < 0 || index * chunks.chunkSize >= total) continue;
+            if (first < 0) {
+                first = last = index;
+            } else if (index === last + 1) {
+                last = index;
+            } else {
+                addCompletedRun(first, last);
+                first = last = index;
+            }
+        }
+        if (first >= 0) addCompletedRun(first, last);
+        for (const [index, amount] of chunks.active) {
+            if (chunks.completed.has(index)) continue;
+            const start = index * chunks.chunkSize;
+            if (start >= total) continue;
+            const length = Math.min(chunks.chunkSize, total - start);
+            const element = document.createElement('div');
+            element.className = 'psd-video-track-chunk active';
+            element.title = `chunk ${index + 1}: starts at ${formatBytes(start)}`;
+            positionChunk(element, start, length, total);
+            const fill = document.createElement('span');
+            fill.className = 'filling';
+            fill.style.width = `${Math.min(100, 100 * amount / length)}%`;
+            element.appendChild(fill);
+            elements.push(element);
+        }
+        track.append(...elements);
+    }
+    /** Chunk updates supplement the existing byte-count progress events. */
+    function updateChunks(msg) {
+        if (state.stage !== 'download' || !state.jobId) return;
+        if (msg.jobId && msg.jobId !== state.jobId) return;
+        if (msg.label !== 'video' && msg.label !== 'audio') return;
+        const chunks = state.chunks[msg.label];
+        const status = msg.status;
+        if (status === 'clear') {
+            state.chunks[msg.label] = { ...newChunkState(), mode: 'single',
+                reason: String(msg.reason || 'Byte ranges unavailable') };
+        } else if (status === 'sync') {
+            const total = Number(msg.total) || 0;
+            const chunkSize = Number(msg.chunkSize) || 0;
+            if (!total || !chunkSize) return;
+            state.chunks[msg.label] = {
+                enabled: true, total, chunkSize, mode: 'parallel',
+                workers: Math.max(1, Number(msg.workerCount) || 1), reason: '',
+                completed: new Set((msg.completed || []).filter(Number.isInteger)),
+                active: new Map()
+            };
+            state[msg.label].total = total;
+        } else {
+            if (!chunks.enabled || !Number.isInteger(msg.index) || msg.index < 0) return;
+            if (status === 'complete') {
+                chunks.completed.add(msg.index);
+                chunks.active.delete(msg.index);
+            } else if (status === 'active' && !chunks.completed.has(msg.index)) {
+                chunks.active.set(msg.index, Math.max(0, Number(msg.received) || 0));
+            }
+        }
+        renderChunkTrack(msg.label);
+    }
+    function setLinearProgress(overallPercent) {
         const root = ensure();
         if (!root) return;
-        const ring = root.querySelector('#psd-video-progress-ring');
-        const progress = Math.max(0, Math.min(100, Number(overallPercent) || 0)) / 100;
-        if (ring) {
-            ring.style.strokeDasharray = String(CIRCUMFERENCE);
-            ring.style.strokeDashoffset = String(CIRCUMFERENCE * (1 - progress));
-        }
+        const percent = Math.max(0, Math.min(100, Number(overallPercent) || 0));
+        const overallFill = root.querySelector('#psd-video-overall-fill');
+        const overallTrack = root.querySelector('#psd-video-overall-track');
+        if (overallFill) overallFill.style.width = `${percent}%`;
+        if (overallTrack) overallTrack.setAttribute('aria-valuenow', String(Math.round(percent)));
     }
     function stageRank(stage) {
         return({
@@ -465,7 +631,7 @@
         const root = ensure();
         if (!root) return false;
         if (!force && stageRank(stage) < stageRank(state.stage)) return false;
-        root.classList.remove('processing', 'started', 'completed', 'cancelled', 'error');
+        root.classList.remove('downloading', 'processing', 'started', 'completed', 'cancelled', 'error');
         const title = root.querySelector('#psd-video-progress-title');
         const info = root.querySelector('#psd-video-progress-detail');
         const cancel = root.querySelector('#psd-video-progress-cancel');
@@ -482,45 +648,38 @@
             info.textContent = formatSeparateProgress();
             cancel.style.display = 'inline-flex';
             cancel.disabled = false;
-            // A previous job may have left the ring in the indeterminate/full
-            // state. Force every new download back to an empty progress ring.
-            const ring = root.querySelector('#psd-video-progress-ring');
-            if (ring) {
-                ring.style.animation = 'none';
-                ring.style.strokeDasharray = String(CIRCUMFERENCE);
-                ring.style.strokeDashoffset = String(CIRCUMFERENCE);
-            }
+            root.classList.add('downloading');
+            renderChunkTrack('video');
+            renderChunkTrack('audio');
         }else if (stage === 'merge') {
             title.textContent = 'Processing video';
             const percent = Math.round(Math.max(0, Math.min(1, Number(state.merge) || 0)) * 100);
             info.textContent = `Processing: ${percent}%`;
             cancel.style.display = 'inline-flex';
             cancel.disabled = false;
-            setRing(percent);
+            setLinearProgress(percent);
         }else if (stage === 'processing') {
             title.textContent = 'Finalizing export';
             info.textContent = 'Please wait..';
             cancel.style.display = 'inline-flex';
             cancel.disabled = false;
             root.classList.add('processing');
-            setRing(0);
+            setLinearProgress(0);
         }else if (stage === 'started') {
             title.textContent = 'Export has started';
             info.textContent = '';
             cancel.style.display = 'none';
             // Chrome now owns the final file download. There is no reliable
-            // byte-progress event here, so start this stage with an empty ring
-            // instead of leaving the processing ring full or showing a fake
-            // progress segment.
-            setRing(0);
+            // byte-progress event here, so start the linear bar at zero.
+            setLinearProgress(0);
         }else if (stage === 'ready') {
-            title.textContent = 'Video exported';
+            title.textContent = 'Video downloaded';
             info.textContent = '';
             cancel.style.display = 'none';
             root.classList.add('completed');
-            setRing(100);
+            setLinearProgress(100);
         }else if (stage === 'cancel' || stage === 'cancelled') {
-            title.textContent = 'Export Cancelled';
+            title.textContent = 'Video cancelled';
             info.textContent = '';
             cancel.style.display = 'none';
             root.classList.add('cancelled');
@@ -584,15 +743,15 @@
         state.audio.total = Math.max(0, Number(audioTotal) || 0);
         state.video = { received: 0, total: state.video.total };
         state.audio = { received: 0, total: state.audio.total };
+        state.chunks = { video: newChunkState(), audio: newChunkState() };
         setState('download', null, true);
-        // Reset again after the state/class change so no stale visual state
-        // from the previous job can flash as a full circle.
-        setRing(0);
+        // Reset again so no visual state leaks from the previous job.
+        setLinearProgress(0);
     }
     function setJob(jobId, videoTotal = 0, audioTotal = 0) {
         state.jobId = jobId || state.jobId;
-        if (videoTotal) state.video.total = Number(videoTotal) || state.video.total;
-        if (audioTotal) state.audio.total = Number(audioTotal) || state.audio.total;
+        if (videoTotal && !state.chunks.video.enabled) state.video.total = Number(videoTotal) || state.video.total;
+        if (audioTotal && !state.chunks.audio.enabled) state.audio.total = Number(audioTotal) || state.audio.total;
         setState(state.stage);
     }
     function update(msg = {
@@ -622,23 +781,24 @@
             }
             bucket.received = Math.max(bucket.received, incoming);
             const reportedTotal = Math.max(0, Number(msg.total) || 0);
-            // Prefer a larger total whenever one arrives (Content-Range often
-            // corrects an undersized clen from the original stream URL).
-            if (reportedTotal > bucket.total) bucket.total = reportedTotal;
+            // New downloader totals replace initial URL estimates in either
+            // direction. The original clen may be too large or too small.
+            if (reportedTotal > 0) bucket.total = reportedTotal;
             // Keep total at least as large as received so the UI never shows inverted figures.
             if (bucket.received > bucket.total) bucket.total = bucket.received;
 
             const percent = downloadOverallPercent();
-            if (state.stage === 'download') setRing(percent * DOWNLOAD_WEIGHT * 100);
+            if (state.stage === 'download') setLinearProgress(percent * DOWNLOAD_WEIGHT * 100);
 
             const detail = root.querySelector('#psd-video-progress-detail');
             if (detail) detail.textContent = formatSeparateProgress();
+            renderChunkTrack(msg.label);
             return;
         }
         if (msg.stage === 'download') {
             if (state.stage === 'download') {
                 const percent = downloadOverallPercent();
-                setRing(percent * DOWNLOAD_WEIGHT * 100);
+                setLinearProgress(percent * DOWNLOAD_WEIGHT * 100);
             }
             return;
         }
@@ -649,7 +809,7 @@
             const percent = state.merge * 100;
             const info = root.querySelector('#psd-video-progress-detail');
             if (info) info.textContent = `Processing: ${Math.round(percent)}%`;
-            setRing(percent);
+            setLinearProgress(percent);
             return;
         }
         if (msg.stage === 'processing') {
@@ -668,10 +828,6 @@
         if (msg.stage === 'cancel') {
             state.jobId = null;
             setState('cancel', null, true);
-            setTimeout(() => {
-                const current = document.getElementById('psd-video-progress-overlay');
-                if (current) current.style.display = 'none';
-            }, 700);
             return;
         }
         if (msg.stage === 'error') {
@@ -686,12 +842,19 @@
         if (reset) {
             state.video = { received: 0, total: state.video.total, lastMsgReceived: 0 };
             state.audio = { received: 0, total: state.audio.total, lastMsgReceived: 0 };
+            state.chunks = { video: newChunkState(), audio: newChunkState() };
+        } else {
+            // Leave finished pieces in place while incomplete requests restart.
+            state.chunks.video.active.clear();
+            state.chunks.audio.active.clear();
         }
+        renderChunkTrack('video');
+        renderChunkTrack('audio');
         syncRestart();
         refreshDetail();
     }
     window[NS] = {
-        show, setJob, update, markRestarted, getJobId: () => state.jobId, getStage: () => state.stage, clearJob: () => {
+        show, setJob, update, updateChunks, markRestarted, getJobId: () => state.jobId, getStage: () => state.stage, clearJob: () => {
             state.jobId = null;
             /* keep qualityLabel for display continuity */
         }

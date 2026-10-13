@@ -3,19 +3,10 @@
     const downloader = window.GDriveVideoStreamDownloader;
     const workers = new Map();
     const rejects = new Map();
+    const pendingSaves = new Map();
 
     /** If the worker goes this long without posting anything at all, treat it as wedged. */
-    const WORKER_IDLE_TIMEOUT_MS = 25000;
-
-    function getAudioCodec(url) {
-        try {
-            const parsedURL = new URL(url);
-            const codecs = parsedURL.searchParams.get('codecs') || '';
-            const mime = parsedURL.searchParams.get('mime') || '';
-            if (/mp4a/i.test(codecs) || /audio\/mp4/i.test(mime)) return 'aac';
-        } catch (_) {}
-        return '';
-    }
+    const WORKER_IDLE_TIMEOUT_MS = 120000;
 
     function cancel(jobId) {
         if (jobId) {
@@ -62,11 +53,8 @@
                         return;
                     }
                     if (data.type === 'done') {
-                        if (!(data.buffer instanceof ArrayBuffer)) {
-                            reject(new Error('Remux returned an invalid MP4 buffer.'));
-                            return;
-                        }
-                        resolve(new Blob([data.buffer], { type: 'video/mp4' }));
+                        if (!data.size) return reject(new Error('The merged MP4 was empty.'));
+                        resolve(data.size);
                         return;
                     }
                     if (data.type === 'error') reject(new Error(data.message || 'Remux failed.'));
@@ -77,7 +65,7 @@
                     type: 'mux',
                     video: videoBlob,
                     audio: audioBlob,
-                    audioCodec: getAudioCodec(job.audioUrl)
+                    jobId: job.jobId
                 });
             });
         } finally {
@@ -88,40 +76,50 @@
         }
     }
 
-    async function triggerDownload(blob, filename, jobId) {
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = filename;
-        link.rel = 'noopener';
-        link.style.display = 'none';
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        downloader.postStageMessage('videoStageDownloadStarted', { jobId });
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
+    /** Chrome saves the disk-backed File URL and confirms the download's final state. */
+    async function saveFile(file, filename, jobId) {
+        const url = URL.createObjectURL(file);
+        pendingSaves.set(jobId, url);
+        try {
+            const reply = await chrome.runtime.sendMessage({
+                type: 'videoStageSaveReady', jobId, url, filename
+            });
+            if (!reply?.success) throw new Error(reply?.error || 'Chrome could not start saving the file.');
+            downloader.postStageMessage('videoStageDownloadStarted', { jobId });
+        } catch (error) {
+            URL.revokeObjectURL(url);
+            pendingSaves.delete(jobId);
+            throw error;
+        }
     }
 
     async function process(job, videoBlob, audioBlob) {
         downloader.throwIfCancelled(job.jobId);
         if (!videoBlob?.size || !audioBlob?.size) {
-            throw new Error('Cannot merge: the video or audio stream is empty or incomplete.');
+            throw new Error('Cannot merge: video or audio is missing.');
         }
-        const mergedBlob = await mergeStreams(job, videoBlob, audioBlob);
+        await mergeStreams(job, videoBlob, audioBlob);
         downloader.throwIfCancelled(job.jobId);
         downloader.postStageMessage('videoStageStatus', { jobId: job.jobId, stage: 'processing' });
-        await triggerDownload(mergedBlob, job.filename, job.jobId);
-        downloader.postStageMessage('videoStageFinished', { jobId: job.jobId });
+        const file = await window.GDriveVideoDiskStorage.outputFile(job.jobId);
+        await saveFile(file, job.filename, job.jobId);
+        // Do not mark Finished until chrome.downloads reports completion.
     }
 
-    async function processSingle(job, mediaBlob) {
+    async function processSingle(job, mediaFile) {
         downloader.throwIfCancelled(job.jobId);
         downloader.postStageMessage('videoStageStatus', { jobId: job.jobId, stage: 'processing' });
-        const type = String(job.mediaMime || 'video/mp4').toLowerCase();
-        const blob = type.includes('mp4') ? mediaBlob : new Blob([mediaBlob], { type: type || 'video/mp4' });
-        await triggerDownload(blob, job.filename, job.jobId);
-        downloader.postStageMessage('videoStageFinished', { jobId: job.jobId });
+        await saveFile(mediaFile, job.filename, job.jobId);
     }
+
+    // Keep the URL and temporary files alive while Chrome copies the download.
+    chrome.runtime.onMessage.addListener(message => {
+        if (message?.target !== 'video-offscreen' || message.type !== 'videoStageSaveCompleteInternal') return;
+        const url = pendingSaves.get(message.jobId);
+        if (url) URL.revokeObjectURL(url);
+        pendingSaves.delete(message.jobId);
+        void window.GDriveVideoDiskStorage.remove(message.jobId).catch(() => {});
+    });
 
     window.GDriveVideoProcessor = { process, processSingle, cancel };
 })();

@@ -49,6 +49,9 @@ async function closeVideoOffscreen() {
         try {
             const jobs = await getStoredJobs();
             if (Object.keys(jobs).length) return;
+            // Blob URLs must remain live until Chrome finishes copying the file.
+            const pending = (await chrome.storage.local.get('gdrivePendingDiskSaves')).gdrivePendingDiskSaves || {};
+            if (Object.keys(pending).length) return;
             await chrome.offscreen.closeDocument();
         } catch (_) {}
     });
@@ -339,8 +342,9 @@ async function startVideoDownload(tabId, request = {}) {
         await ensureVideoOffscreen();
         await sendTab(tabId, { type: 'videoStagePreload', jobId, ...sizes });
         await sendTab(tabId, { type: 'videoStageStarted', jobId, ...sizes });
-        sendOffscreen({ type: 'videoStageStart', jobId });
-
+        // The picker activates this job only after the overlay is ready.
+        // Starting here could let a fast download finish before the caller
+        // associates its job ID, leaving the next attempt stuck on Processing.
         return { success: true, jobId, ...sizes };
     } catch (error) {
         if (jobId) await removeVideoStageJob(jobId);

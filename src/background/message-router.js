@@ -837,6 +837,46 @@ const handleGetStreams = async ({ tabId }) => {
  */
 const handleDownloadVideo = ({ request, tabId }) => startVideoDownload(tabId, request || {});
 
+/** Start a queued job only after the caller has mounted its progress overlay. */
+async function handleActivateVideoStage({ request, tabId }) {
+    const jobId = String(request.jobId || '');
+    const job = (await getStoredJobs())[jobId];
+    if (!job || job.sourceTabId !== tabId) {
+        return { success: false, error: 'This video download is no longer active.' };
+    }
+
+    try {
+        // Retry delivery once if Chrome closed the offscreen page between
+        // creation and sending. Each job ID is guarded against duplicate runs.
+        let error = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                await ensureVideoOffscreen();
+                let timeout;
+                let result;
+                try {
+                    result = await Promise.race([
+                        chrome.runtime.sendMessage({ target: 'video-offscreen', type: 'videoStageStart', jobId }),
+                        new Promise((_, reject) => {
+                            timeout = setTimeout(() => reject(new Error('Downloader did not respond.')), 5000);
+                        })
+                    ]);
+                } finally {
+                    clearTimeout(timeout);
+                }
+                if (result?.accepted) return { success: true, jobId };
+                throw new Error('Downloader did not accept the job.');
+            } catch (caught) {
+                error = caught;
+            }
+        }
+        throw error;
+    } catch (error) {
+        await removeVideoStageJob(jobId);
+        return { success: false, error: error?.message || String(error) };
+    }
+}
+
 /**
  * Type: getVideoStageJob
  * Retrieves staging job metadata requested by offscreen downloader.
@@ -844,6 +884,66 @@ const handleDownloadVideo = ({ request, tabId }) => startVideoDownload(tabId, re
 async function handleGetVideoStageJob({ request }) {
     const job = (await getStoredJobs())[request.jobId];
     return job ? { success: true, job } : { success: false, error: 'Staging job not found.' };
+}
+
+/** Chrome's downloads API saves OPFS-backed Files without creating a giant RAM buffer. */
+const PENDING_SAVES_KEY = 'gdrivePendingDiskSaves';
+let pendingSaveLock = Promise.resolve();
+
+function editPendingSaves(change) {
+    const next = pendingSaveLock.then(async () => {
+        const saved = await chrome.storage.local.get(PENDING_SAVES_KEY);
+        const pending = saved[PENDING_SAVES_KEY] || {};
+        const result = change(pending);
+        await chrome.storage.local.set({ [PENDING_SAVES_KEY]: pending });
+        return result;
+    });
+    pendingSaveLock = next.catch(() => {});
+    return next;
+}
+
+async function settleVideoSave(downloadId, state, errorMessage = '') {
+    const item = await editPendingSaves(pending => {
+        const key = String(downloadId);
+        const value = pending[key];
+        delete pending[key];
+        return value;
+    });
+    if (!item) return;
+    sendOffscreen({ type: 'videoStageSaveCompleteInternal', jobId: item.jobId });
+    await handleVideoStageMessage({ request: {
+        type: state === 'complete' ? 'videoStageFinished' : 'videoStageError',
+        jobId: item.jobId,
+        message: errorMessage || 'Chrome could not save the MP4 file.'
+    }});
+}
+
+chrome.downloads.onChanged.addListener(delta => {
+    if (!delta.state?.current || !['complete', 'interrupted'].includes(delta.state.current)) return;
+    void settleVideoSave(delta.id, delta.state.current, delta.error?.current).catch(() => {});
+});
+
+async function startDiskBackedSave(request) {
+    const job = (await getStoredJobs())[request.jobId];
+    if (!job) return { success: false, error: 'Download was cancelled.' };
+    const url = String(request.url || '');
+    if (!url.startsWith(`blob:chrome-extension://${chrome.runtime.id}/`)) {
+        return { success: false, error: 'Invalid extension download URL.' };
+    }
+    // Use the job's stored filename, not a filename supplied in a runtime message.
+    const id = await chrome.downloads.download({
+        url,
+        filename: String(job.filename || 'video.mp4').replace(/[\\:*?"<>|]/g, '_'),
+        conflictAction: 'uniquify', saveAs: false
+    });
+    if (!Number.isInteger(id)) return { success: false, error: 'Chrome did not accept the download.' };
+    await editPendingSaves(pending => { pending[String(id)] = { jobId: request.jobId }; });
+    // A very small download can finish before the pending record is written.
+    const [existing] = await chrome.downloads.search({ id });
+    if (existing?.state === 'complete' || existing?.state === 'interrupted') {
+        void settleVideoSave(id, existing.state, existing.error).catch(() => {});
+    }
+    return { success: true, downloadId: id };
 }
 
 /** Set of terminal stage job event types */
@@ -859,6 +959,10 @@ const FINISHED_STAGE_TYPES = new Set(['videoStageFinished', 'videoStageError', '
  */
 async function cancelVideoStage(jobId, job, options = {}) {
     sendOffscreen({ type: 'videoStageCancelInternal', jobId });
+    const pending = (await chrome.storage.local.get(PENDING_SAVES_KEY))[PENDING_SAVES_KEY] || {};
+    for (const [id, save] of Object.entries(pending)) {
+        if (save.jobId === jobId) await chrome.downloads.cancel(Number(id)).catch(() => {});
+    }
     if (!options.silent && job?.sourceTabId != null) {
         await sendTab(job.sourceTabId, { type: 'videoStageCancelled', jobId });
     }
@@ -898,6 +1002,7 @@ async function handleVideoStageMessage({ request }) {
 
     // Restart comes from the tab's overlay; it is a command, not a status to relay back.
     if (request.type === 'videoStageRestart') return restartVideoStage(request.jobId);
+    if (request.type === 'videoStageSaveReady') return startDiskBackedSave(request);
 
     // Forward progress/status message to originating tab UI
     if (job?.sourceTabId != null && !isCancel) await sendTab(job.sourceTabId, { type: request.type, ...request });
@@ -931,7 +1036,8 @@ const ACTION_HANDLERS = Object.freeze({
     captureQualityForDownload: requireDriveTab(handleCaptureQualityForDownload),
     clearTabCaptureState: requireDriveTab(handleClearTabCaptureState),
     getStreams: handleGetStreams,
-    downloadVideo: handleDownloadVideo
+    downloadVideo: handleDownloadVideo,
+    activateVideoStage: requireDriveTab(handleActivateVideoStage)
 });
 
 /**
@@ -977,6 +1083,10 @@ async function handleRuntimeMessage(request = {}, sender = {}) {
  * - Catches any uncaught Promise rejections and replies with `{ success: false, error }`.
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    // These commands are for the offscreen document. Do not reply from the
+    // service worker: otherwise Chrome may resolve the message with an empty
+    // response before the actual downloader accepts it.
+    if (request?.target === 'video-offscreen') return false;
     handleRuntimeMessage(request, sender)
         .then(sendResponse)
         .catch(error => sendResponse({ success: false, error: error?.message || String(error) }));

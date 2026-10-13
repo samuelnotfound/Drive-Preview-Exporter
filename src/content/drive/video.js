@@ -17,7 +17,7 @@
 
     const STAGE_MESSAGES = new Set([
         'videoFormatsDetected', 'videoStreamDetected',
-        'videoStagePreload', 'videoStageStarted', 'videoStageStatus', 'videoStageProgress',
+        'videoStagePreload', 'videoStageStarted', 'videoStageStatus', 'videoStageProgress', 'videoStageChunkProgress',
         'videoStageMergeProgress', 'videoStageDownloadStarted', 'videoStageFinished',
         'videoStageError', 'videoStageCancelled', 'videoStageRestarted'
     ]);
@@ -252,18 +252,14 @@
 
     function isDriveVideoPlayingNow() {
         try {
-            const videos = core.collectVideoElements?.() || [...document.querySelectorAll('video')];
-            for (const v of videos) {
+            const players = core.collectVideoElements?.() || document.querySelectorAll('video');
+            return [...players].some(player => {
                 try {
-                    if (!v || v.ended) continue;
-                    // Actively playing
-                    if (!v.paused && (v.currentTime > 0.05 || v.readyState >= 2)) return true;
-                    // Buffering after user hit play
-                    if (!v.paused && v.readyState >= 1) return true;
-                } catch (_) {}
-            }
-        } catch (_) {}
-        return false;
+                    return player && !player.ended && !player.paused &&
+                        (player.readyState >= 1 || player.currentTime > 0.05);
+                } catch (_) { return false; }
+            });
+        } catch (_) { return false; }
     }
 
     /** Download is allowed only when a real playback signal exists. */
@@ -585,7 +581,6 @@
     }
 
     function resetViewerState(previousFileId) {
-        if (video.operation !== 'staging') quality.hidePageBlocker();
         quality.stopWatch();
 
         const root = document.getElementById('psd-video-quality-picker');
@@ -669,84 +664,49 @@
         }, true);
     }
 
+    /** Keep captured audio when a network update contains video only. */
+    function mergeAvailableFormats(previous, incoming) {
+        return Object.fromEntries(['video', 'audio', 'progressive'].map(kind => [
+            kind, incoming?.[kind]?.length ? incoming[kind] : (previous?.[kind] || [])
+        ]));
+    }
+
     function handleFormatMessage(message) {
         if (!core.isCurrentVideoMessage(message)) return;
+        const fullUpdate = message.type === 'videoFormatsDetected';
+        const incoming = message.formats;
 
-        if (message.type === 'videoFormatsDetected') {
-            video.formats = message.formats || { video: [], audio: [], progressive: [] };
-            // Apply menu options in the same tick as formats so the picker
-            // never renders formats against a stale/empty menu snapshot.
-            const menu =
-                message.quality?.options ||
-                message.qualityOptions ||
-                null;
-            if (Array.isArray(menu) && menu.length) {
-                video.qualityMenuOptions = menu
-                    .map(option => ({
-                        height: Number(option?.height || 0),
-                        label: String(option?.text || option?.label || '').trim(),
-                        text: String(option?.text || option?.label || '').trim()
-                    }))
-                    .filter(option => option.height > 0);
+        if (fullUpdate) {
+            video.formats = incoming || { video: [], audio: [], progressive: [] };
+            const options = message.quality?.options || message.qualityOptions;
+            if (Array.isArray(options) && options.length) {
+                video.qualityMenuOptions = core.normalizeQualityOptions(options);
             }
-            // Keep label-only picker rows intact; only merge audio onto the picker.
-            if ((video.operation === 'picker' || video.pickerFormats) && Array.isArray(video.qualityMenuOptions) && video.qualityMenuOptions.length) {
-                const pf = video.pickerFormats || { video: [], audio: [], progressive: [] };
+        } else if (incoming) {
+            video.formats = mergeAvailableFormats(video.formats, incoming);
+        }
+
+        if ((video.operation === 'picker' || video.pickerFormats) && incoming) {
+            const previous = video.pickerFormats || { video: [], audio: [], progressive: [] };
+            const options = video.qualityMenuOptions;
+            if (options?.length) {
                 video.pickerFormats = {
-                    video: pf.video?.length ? pf.video : video.qualityMenuOptions.map(o => ({
-                        id: `label:${o.height}`,
-                        height: o.height,
-                        qualityHeight: o.height,
-                        probeQuality: o.label || `${o.height}p`,
-                        menuLabel: o.label || `${o.height}p`,
-                        labelOnly: true,
-                        url: ''
-                    })),
-                    audio: (message.formats?.audio?.length ? message.formats.audio : pf.audio) || [],
-                    progressive: pf.progressive || []
+                    video: previous.video?.length ? previous.video : core.makeLabelOnlyFormats(options),
+                    audio: incoming.audio?.length ? incoming.audio : (previous.audio || []),
+                    progressive: previous.progressive || []
                 };
-            } else if (video.operation === 'picker' || video.pickerFormats) {
-                video.pickerFormats = core.cloneFormats(video.formats);
+            } else {
+                video.pickerFormats = fullUpdate
+                    ? core.cloneFormats(video.formats)
+                    : mergeAvailableFormats(previous, incoming);
             }
-        } else if (message.formats) {
-            // Merge so a video-only update never wipes already-captured audio.
-            const incoming = message.formats || {};
-            const base = video.formats || { video: [], audio: [], progressive: [] };
-            video.formats = {
-                video: (incoming.video?.length ? incoming.video : base.video) || [],
-                audio: (incoming.audio?.length ? incoming.audio : base.audio) || [],
-                progressive: (incoming.progressive?.length ? incoming.progressive : base.progressive) || []
-            };
-            // Never replace label rows with a single live stream during/after download.
-            if ((video.operation === 'picker' || video.pickerFormats) && Array.isArray(video.qualityMenuOptions) && video.qualityMenuOptions.length) {
-                const pf = video.pickerFormats || { video: [], audio: [], progressive: [] };
-                video.pickerFormats = {
-                    video: pf.video?.length ? pf.video : video.qualityMenuOptions.map(o => ({
-                        id: `label:${o.height}`,
-                        height: o.height,
-                        qualityHeight: o.height,
-                        probeQuality: o.label || `${o.height}p`,
-                        menuLabel: o.label || `${o.height}p`,
-                        labelOnly: true,
-                        url: ''
-                    })),
-                    audio: (incoming.audio?.length ? incoming.audio : pf.audio) || [],
-                    progressive: pf.progressive || []
-                };
-            } else if (video.operation === 'picker' || video.pickerFormats) {
-                const pf = video.pickerFormats || { video: [], audio: [], progressive: [] };
-                video.pickerFormats = {
-                    video: (incoming.video?.length ? incoming.video : pf.video) || [],
-                    audio: (incoming.audio?.length ? incoming.audio : pf.audio) || [],
-                    progressive: (incoming.progressive?.length ? incoming.progressive : pf.progressive) || []
-                };
-            }
+        } else if (fullUpdate && (video.operation === 'picker' || video.pickerFormats)) {
+            video.pickerFormats = core.cloneFormats(video.formats);
         }
 
         if (message.type === 'videoStreamDetected') {
             video.playbackStarted = true;
             video.streamActivityAt = Date.now();
-            updateVideoMenuState();
         }
         updateVideoMenuState();
         if (video.operation === 'picker') quality.update();
@@ -769,6 +729,9 @@
                 break;
             case 'videoStageProgress':
                 videoOverlay.update({ label: message.label, received: message.received, total: message.total });
+                break;
+            case 'videoStageChunkProgress':
+                videoOverlay.updateChunks?.(message);
                 break;
             case 'videoStageMergeProgress':
                 videoOverlay.update({ stage: 'merge', progress: message.progress });

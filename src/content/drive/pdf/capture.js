@@ -75,80 +75,44 @@
         ) || null;
     }
 
-    function waitForPageImage(page, runId) {
-        const ready = getPageImage(page);
-        if (ready) return Promise.resolve(ready);
-
-        page.scrollIntoView({ block: 'center' });
+    function waitForImage(findImage, observeRoot, timeoutMs, errorMessage, runId, pollMs = 100) {
+        const image = findImage();
+        if (image) return Promise.resolve(image);
 
         return new Promise((resolve, reject) => {
-            let done = false;
-            const finish = (error, image) => {
-                if (done) return;
-                done = true;
+            let finished = false;
+            const stop = (error, image) => {
+                if (finished) return;
+                finished = true;
                 observer.disconnect();
                 clearInterval(poll);
-                clearTimeout(timer);
+                clearTimeout(timeout);
                 error ? reject(error) : resolve(image);
             };
-
             const check = () => {
-                if (!isCurrentRun(runId)) {
-                    finish(new Error('Capture cancelled.'));
-                    return;
-                }
-
-                const image = getPageImage(page);
-                if (image) finish(null, image);
+                if (!isCurrentRun(runId)) return stop(new Error('Capture cancelled.'));
+                const ready = findImage();
+                if (ready) stop(null, ready);
             };
-
             const observer = new MutationObserver(check);
-            const poll = setInterval(check, 100);
-            const timer = setTimeout(
-                () => finish(new Error('Timed out waiting for page image')),
-                WAIT_FOR_IMAGE
-            );
-
-            observer.observe(page, { childList: true, attributes: true, subtree: true });
+            const poll = setInterval(check, pollMs);
+            const timeout = setTimeout(() => stop(new Error(errorMessage)), timeoutMs);
+            observer.observe(observeRoot, { childList: true, attributes: true, subtree: true });
             check();
         });
     }
 
-    function waitForFirstPage(runId) {
-        const ready = getFirstPageImage();
+    function waitForPageImage(page, runId) {
+        const ready = getPageImage(page);
         if (ready) return Promise.resolve(ready);
+        page.scrollIntoView({ block: 'center' });
+        return waitForImage(() => getPageImage(page), page, WAIT_FOR_IMAGE,
+            'Timed out waiting for page image', runId);
+    }
 
-        return new Promise((resolve, reject) => {
-            let done = false;
-            const finish = (error, image) => {
-                if (done) return;
-                done = true;
-                observer.disconnect();
-                clearInterval(poll);
-                clearTimeout(timer);
-                error ? reject(error) : resolve(image);
-            };
-
-            const check = () => {
-                if (!isCurrentRun(runId)) {
-                    finish(new Error('Capture cancelled.'));
-                    return;
-                }
-
-                const image = getFirstPageImage();
-                if (image) finish(null, image);
-            };
-
-            const observer = new MutationObserver(check);
-            const poll = setInterval(check, 150);
-            const timer = setTimeout(
-                () => finish(new Error('Could not find rendered PDF pages')),
-                WAIT_FOR_VIEWER
-            );
-
-            observer.observe(document.body, { childList: true, subtree: true });
-            check();
-        });
+    function waitForFirstPage(runId) {
+        return waitForImage(getFirstPageImage, document.body, WAIT_FOR_VIEWER,
+            'Could not find rendered PDF pages', runId, 150);
     }
 
     async function imageToJPEG(image, runId) {

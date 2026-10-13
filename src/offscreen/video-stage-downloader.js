@@ -8,8 +8,10 @@
     const jobRuntime = new Map();
 
     const CHUNK_SIZE = 4 * 1024 * 1024;
+    /** Limit simultaneous requests per stream to avoid overloading Drive. */
+    const STREAM_WORKERS = { video: 4, audio: 4 };
     /** No bytes received for this long → treat the stream as stuck and resume it. */
-    const STUCK_MS = 5000;
+    const STUCK_MS = 20000;
     /** Automatic resumes per stream before we stop and wait for the user's Restart click. */
     const MAX_STUCK_RESTARTS = 2;
     /** Retries for one failed range request (each retry tries Range header, then ?range=). */
@@ -90,13 +92,42 @@
         return { start: Number(m[1]), end: Number(m[2]), total: m[3] === '*' ? 0 : Number(m[3]) };
     }
 
+    function rangeUnsupported(message) {
+        return Object.assign(new Error(message), { name: 'RangeUnsupportedError' });
+    }
+
+    /**
+     * Some Drive audio responses omit Content-Length even for ?range=0-0.
+     * Check at most two response bytes before trusting a headerless probe.
+     * Never buffer a full stream just to decide whether it supports ranges.
+     */
+    async function isSingleByteResponse(response) {
+        const reader = response.body?.getReader?.();
+        if (!reader) return false;
+        let received = 0;
+        try {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) return received === 1;
+                received += value?.byteLength || 0;
+                if (received > 1) return false;
+            }
+        } finally {
+            try { await reader.cancel(); } catch (_) {}
+            try { reader.releaseLock(); } catch (_) {}
+        }
+    }
+
     /**
      * Read a response body while reporting every network read, so progress
      * (and stuck detection) is byte-accurate instead of per-4-MiB-chunk.
      */
-    async function readBody(response, onBytes) {
+    async function readBody(response, onBytes, maxBytes = Infinity) {
         if (!response.body?.getReader) {
             const whole = new Uint8Array(await response.arrayBuffer());
+            if (whole.byteLength > maxBytes) {
+                throw new Error('The server sent more bytes than requested.');
+            }
             onBytes(whole.byteLength);
             return whole;
         }
@@ -108,6 +139,10 @@
                 const { done, value } = await reader.read();
                 if (done) break;
                 if (value?.byteLength) {
+                    if (size + value.byteLength > maxBytes) {
+                        try { await reader.cancel(); } catch (_) {}
+                        throw new Error('The server sent more bytes than requested.');
+                    }
                     parts.push(value);
                     size += value.byteLength;
                     onBytes(value.byteLength);
@@ -124,30 +159,60 @@
     }
 
     /**
-     * Ask the server for the real stream size (headers only; body is cancelled).
-     * Drive's clen is sometimes wrong, and a wrong size is exactly what lets a
-     * truncated stream look "complete". Returns 0 when the server won't say.
+     * Confirm byte-range support before opening multiple connections. A 200
+     * response to a Range header is not proof that parallel chunks are safe.
+     * Google's ?range= form is also supported when it returns an exact slice.
+     * Prefer headers. For headerless ?range probes, read at most two bytes
+     * before cancelling, so we never buffer a full file during discovery.
      */
-    async function probeTotal(baseUrl, ctx) {
-        try {
-            const response = await fetch(baseUrl, {
-                credentials: 'include',
-                cache: 'no-store',
-                signal: ctx.signal,
-                headers: { Range: 'bytes=0-0' }
-            });
-            try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
-            ctx.markProgress();
-            if (response.status === 206) {
-                return parseContentRange(response.headers.get('content-range'))?.total || 0;
+    async function probeStream(baseUrl, totalHint, ctx) {
+        let total = Math.max(0, Number(totalHint) || 0);
+        const probes = [
+            { mode: 'header', url: baseUrl, headers: { Range: 'bytes=0-0' } },
+            { mode: 'query', url: makeRangeQueryURL(baseUrl, 0, 0), headers: {} }
+        ];
+
+        for (const probe of probes) {
+            try {
+                const response = await fetch(probe.url, {
+                    credentials: 'include',
+                    cache: 'no-store',
+                    signal: ctx.signal,
+                    headers: probe.headers
+                });
+                ctx.markProgress();
+                const range = parseContentRange(response.headers.get('content-range'));
+                const length = Number(response.headers.get('content-length')) || 0;
+                if (response.status === 206 && range?.start === 0 && range.end === 0) {
+                    if (range.total > 0) total = range.total;
+                    if (total > 0) {
+                        try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+                        return { total, mode: probe.mode };
+                    }
+                }
+                // Some Drive URLs respond 200 to ?range=0-0 but return one byte.
+                if (probe.mode === 'query' && response.status === 200 && total > 1) {
+                    if (length === 1) {
+                        try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+                        return { total, mode: 'query' };
+                    }
+                    if (!length && await isSingleByteResponse(response)) {
+                        return { total, mode: 'query' };
+                    }
+                }
+                // Do not replace a valid clen hint with a one-byte 200 probe.
+                // Some servers reply to Range: bytes=0-0 with status 200 and
+                // Content-Length: 1. That must not turn a large audio stream
+                // into a "1 byte file" before we try Google's ?range= form.
+                if (probe.mode === 'header' && response.status === 200 && !total && length > 1) {
+                    total = length;
+                }
+                try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+            } catch (err) {
+                if (ctx.signal.aborted || err?.name === 'AbortError') throw err;
             }
-            if (response.status === 200) {
-                return Number(response.headers.get('content-length')) || 0;
-            }
-        } catch (err) {
-            if (err?.name === 'AbortError') throw err;
         }
-        return 0;
+        return { total, mode: null };
     }
 
     /**
@@ -159,7 +224,7 @@
         const attempts = [
             { mode: 'header', url: baseUrl, headers: { Range: `bytes=${start}-${end}` } },
             { mode: 'query', url: makeRangeQueryURL(baseUrl, start, end), headers: {} }
-        ];
+        ].filter(attempt => !ctx.rangeMode || attempt.mode === ctx.rangeMode);
 
         let lastError = null;
         for (const attempt of attempts) {
@@ -178,18 +243,39 @@
 
                 if (!response.ok && response.status !== 206) {
                     lastError = new Error(`${label} download failed (${response.status})`);
+                    try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
                     continue;
                 }
 
                 const range = parseContentRange(response.headers.get('content-range'));
-                const body = await readBody(response, onBytes);
+                const expected = end - start + 1;
+                const declared = Number(response.headers.get('content-length')) || 0;
+                if (ctx.strictRange && (
+                    (attempt.mode === 'header' && response.status !== 206)
+                    || (response.status === 206 && !range)
+                    || (response.status === 200 && declared > expected)
+                )) {
+                    try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+                    throw rangeUnsupported(`${label} server stopped supporting byte ranges`);
+                }
+
+                if (range && (
+                    range.start !== start || range.end > end || range.end < range.start
+                    || (range.total > 0 && range.total <= range.end)
+                )) {
+                    try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+                    lastError = new Error(`${label} server returned the wrong byte range`);
+                    continue;
+                }
+                const body = await readBody(response, onBytes, ctx.strictRange ? expected : Infinity);
                 if (!body.byteLength) {
                     lastError = new Error(`${label} download returned no data`);
                     continue;
                 }
 
-                if (range && range.start !== start) {
-                    lastError = new Error(`${label} server returned the wrong byte range`);
+                if (ctx.strictRange && (body.byteLength > expected
+                    || (range && body.byteLength !== range.end - range.start + 1))) {
+                    lastError = new Error(`${label} received an invalid chunk length`);
                     continue;
                 }
 
@@ -206,7 +292,12 @@
                 return { data: body, total: range?.total || 0, whole: false };
             } catch (err) {
                 if (err?.name === 'AbortError') throw err;
+                if (err?.name === 'RangeUnsupportedError') throw err;
                 lastError = err;
+            } finally {
+                // Clear the current attempt's in-flight bytes on failure or
+                // completion so retries and other workers cannot double-count.
+                ctx.report(0);
             }
         }
         throw lastError || new Error(`${label} download failed`);
@@ -218,52 +309,52 @@
             try {
                 return await fetchRange(baseUrl, start, end, ctx, label);
             } catch (err) {
-                if (err?.name === 'AbortError' || cancelledJobs.has(ctx.jobId)) throw err;
+                if (err?.name === 'AbortError' || err?.name === 'RangeUnsupportedError'
+                    || cancelledJobs.has(ctx.jobId)) throw err;
                 lastError = err;
-                await sleepAbortable(RETRY_BASE_MS * (i + 1), ctx.signal);
+                if (i + 1 < CHUNK_RETRIES) {
+                    await sleepAbortable(RETRY_BASE_MS * (i + 1), ctx.signal);
+                }
             }
         }
         throw lastError || new Error(`${label} download failed`);
     }
 
-    /** Server gave us no size at all: fetch the stream in one request. */
+    /** Stream a non-ranged response directly to disk, regardless of file size. */
     async function pullWhole(st, baseUrl, label, ctx) {
-        let inflight = 0;
+        // Without ranges an interrupted transfer must start at byte zero.
+        await st.disk.reset();
+        st.bytes = 0;
         const response = await fetch(baseUrl, {
-            credentials: 'include',
-            cache: 'no-store',
-            signal: ctx.signal
+            credentials: 'include', cache: 'no-store', signal: ctx.signal
         });
-        ctx.markProgress();
         if (!response.ok) throw new Error(`${label} download failed (${response.status})`);
         const declared = Number(response.headers.get('content-length')) || 0;
-        const body = await readBody(response, n => { inflight += n; ctx.markProgress(); ctx.report(inflight); });
-        if (!body.byteLength) throw new Error(`${label} download failed`);
-        if (declared && body.byteLength < declared) {
-            throw new Error(`${label} download incomplete (${body.byteLength} of ${declared} bytes)`);
+        const reader = response.body?.getReader?.();
+        if (!reader) throw new Error('This browser cannot stream the response to disk.');
+        try {
+            for (;;) {
+                throwIfCancelled(ctx.jobId);
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (!value?.byteLength) continue;
+                await st.disk.write(st.bytes, value);
+                st.bytes += value.byteLength;
+                ctx.markProgress();
+                ctx.report(0, true);
+            }
+        } finally {
+            try { reader.releaseLock(); } catch (_) {}
         }
-        st.chunks = [body];
-        st.bytes = body.byteLength;
-        st.total = body.byteLength;
+        if (!st.bytes || (declared && st.bytes !== declared)) {
+            throw new Error(`${label} download incomplete (${st.bytes} of ${declared} bytes)`);
+        }
+        st.total = st.bytes;
+        ctx.report(0, true);
     }
 
-    /**
-     * Pull bytes [st.bytes, st.total). Resumes from wherever the previous
-     * attempt stopped. Only returns once EVERY byte has been received;
-     * anything short throws instead of returning a partial stream.
-     */
-    async function pullStream(st, baseUrl, label, ctx) {
-        if (st.bytes === 0 && !st.probed) {
-            const probed = await probeTotal(baseUrl, ctx);
-            st.probed = true;
-            if (probed > 0) st.total = probed;
-        }
-
-        if (st.total <= 0) {
-            await pullWhole(st, baseUrl, label, ctx);
-            return;
-        }
-
+    /** Sequential download, including servers that don't support safe ranges. */
+    async function pullSequential(st, baseUrl, label, ctx) {
         while (st.bytes < st.total) {
             throwIfCancelled(ctx.jobId);
             if (ctx.signal.aborted) throw abortError();
@@ -276,12 +367,13 @@
             if (res.total > 0 && res.total !== st.total) st.total = res.total;
 
             if (res.whole) {
-                st.chunks = [res.data];
+                await st.disk.reset();
+                await st.disk.write(0, res.data);
                 st.bytes = res.data.byteLength;
                 st.total = res.total;
             } else {
                 // A short slice is fine: we simply continue from the new offset.
-                st.chunks.push(res.data);
+                await st.disk.write(start, res.data);
                 st.bytes += res.data.byteLength;
             }
             ctx.report(0, true);
@@ -291,6 +383,182 @@
             throw new Error(`${label} download incomplete (${st.bytes} of ${st.total} bytes)`);
         }
         if (st.bytes > st.total) st.total = st.bytes;
+    }
+
+    /** Fetch one fixed-position chunk, including any short partial responses. */
+    async function pullParallelChunk(st, baseUrl, label, ctx, index, chunkSize) {
+        const start = index * chunkSize;
+        const end = Math.min(start + chunkSize - 1, st.total - 1);
+        const parts = [];
+        let cursor = start;
+
+        while (cursor <= end) {
+            const res = await fetchRangeWithRetry(baseUrl, cursor, end, ctx, label);
+            if (res.whole) throw rangeUnsupported(`${label} server ignored a range request`);
+            if (res.total > 0 && res.total !== st.total) {
+                throw new Error(`${label} stream size changed during download; please retry.`);
+            }
+            if (!res.data.byteLength || res.data.byteLength > end - cursor + 1) {
+                throw new Error(`${label} returned an invalid chunk`);
+            }
+            parts.push(res.data);
+            ctx.onPartComplete?.(res.data.byteLength);
+            cursor += res.data.byteLength;
+        }
+
+        if (parts.length === 1) return parts[0];
+        const combined = new Uint8Array(end - start + 1);
+        let offset = 0;
+        for (const part of parts) {
+            combined.set(part, offset);
+            offset += part.byteLength;
+        }
+        return combined;
+    }
+
+    /**
+     * A small worker pool claims disjoint chunks. Completed chunks stay in the
+     * map across manual and automatic restarts; aborted chunks are re-fetched.
+     */
+    async function pullParallel(st, baseUrl, label, ctx) {
+        const requestedWorkers = STREAM_WORKERS[label] || 4;
+        // Always request fixed 4 MiB ranges (apart from the final short range).
+        // Do not split small audio streams into tiny slices just to fill workers:
+        // that can add network overhead without improving transfer speed.
+        const chunkSize = CHUNK_SIZE;
+        const chunkCount = Math.ceil(st.total / chunkSize);
+        const workerCount = Math.min(requestedWorkers, chunkCount);
+        if (!st.parallelChunks) st.parallelChunks = new Set();
+
+        // Tell the overlay which byte positions are already complete. A new
+        // attempt clears stale active markers but retains finished chunks.
+        postStageMessage('videoStageChunkProgress', {
+            jobId: ctx.jobId, label, status: 'sync', total: st.total,
+            chunkSize, workerCount, completed: [...st.parallelChunks.keys()]
+        });
+
+        const controller = new AbortController();
+        const onAbort = () => controller.abort();
+        if (ctx.signal.aborted) controller.abort();
+        else ctx.signal.addEventListener('abort', onAbort, { once: true });
+
+        const inflight = new Map();
+        let nextIndex = 0;
+        let firstError = null;
+
+        const worker = async workerId => {
+            const workerCtx = {
+                ...ctx,
+                signal: controller.signal,
+                strictRange: true,
+                rangeMode: st.rangeMode,
+                report: bytes => {
+                    inflight.set(workerId, bytes);
+                    let inProgress = 0;
+                    for (const count of inflight.values()) inProgress += count;
+                    ctx.report(inProgress);
+                }
+            };
+
+            try {
+                while (nextIndex < chunkCount) {
+                    if (controller.signal.aborted) throw abortError();
+                    const index = nextIndex++;
+                    if (st.parallelChunks.has(index)) continue;
+
+                    const start = index * chunkSize;
+                    const end = Math.min(start + chunkSize - 1, st.total - 1);
+                    const chunkLength = end - start + 1;
+                    const sendChunk = (status, received = 0) => postStageMessage('videoStageChunkProgress', {
+                        jobId: ctx.jobId, label, status, index, start, end,
+                        total: st.total, received: Math.min(chunkLength, received)
+                    });
+                    let lastChunkUpdate = 0;
+                    let completedPrefix = 0;
+                    const chunkCtx = {
+                        ...workerCtx,
+                        report: bytes => {
+                            workerCtx.report(bytes);
+                            const now = performance.now();
+                            if (bytes > 0 && now - lastChunkUpdate >= 160) {
+                                lastChunkUpdate = now;
+                                sendChunk('active', completedPrefix + bytes);
+                            }
+                        },
+                        // Short range responses are valid; keep their completed
+                        // portion visible when the next sub-range starts.
+                        onPartComplete: length => { completedPrefix += length; }
+                    };
+                    sendChunk('active');
+                    const data = await pullParallelChunk(st, baseUrl, label, chunkCtx, index, chunkSize);
+                    if (controller.signal.aborted) throw abortError();
+                    await st.disk.write(start, data);
+                    st.parallelChunks.add(index);
+                    st.bytes += data.byteLength;
+                    workerCtx.report(0);
+                    sendChunk('complete', data.byteLength);
+                    ctx.report(0, true);
+                }
+            } catch (error) {
+                if (!firstError) firstError = error;
+                controller.abort();
+            } finally {
+                inflight.delete(workerId);
+            }
+        };
+
+        try {
+            await Promise.all(Array.from({ length: workerCount }, (_, i) => worker(i)));
+            if (firstError) throw firstError;
+            if (st.parallelChunks.size !== chunkCount || st.bytes !== st.total) {
+                throw new Error(`${label} download incomplete (${st.bytes} of ${st.total} bytes)`);
+            }
+            st.parallelChunks = null;
+        } finally {
+            ctx.signal.removeEventListener('abort', onAbort);
+            ctx.report(0, true);
+        }
+    }
+
+    /** Select parallel requests only when byte-range support was verified. */
+    async function pullStream(st, baseUrl, label, ctx) {
+        if (!st.probed) {
+            const { total, mode } = await probeStream(baseUrl, st.total, ctx);
+            st.total = total;
+            st.rangeMode = mode;
+            st.probed = true;
+        }
+
+        if (st.total <= 0) {
+            postStageMessage('videoStageChunkProgress', {
+                jobId: ctx.jobId, label, status: 'clear', reason: 'File size or byte ranges unavailable'
+            });
+            return pullWhole(st, baseUrl, label, ctx);
+        }
+        if (st.rangeMode && st.total >= (STREAM_WORKERS[label] || 4)) {
+            try {
+                await pullParallel(st, baseUrl, label, ctx);
+                return;
+            } catch (error) {
+                if (error?.name !== 'RangeUnsupportedError') throw error;
+                // Don't mix incompatible responses with already-completed chunks.
+                st.parallelChunks = null;
+                await st.disk.reset();
+                st.bytes = 0;
+                st.rangeMode = null;
+                postStageMessage('videoStageChunkProgress', {
+                    jobId: ctx.jobId, label, status: 'clear', reason: 'Server stopped accepting byte ranges'
+                });
+            }
+        }
+        if (!st.rangeMode) {
+            postStageMessage('videoStageChunkProgress', {
+                jobId: ctx.jobId, label, status: 'clear',
+                reason: 'Server did not confirm byte-range support'
+            });
+        }
+        if (!st.rangeMode) await pullWhole(st, baseUrl, label, ctx);
+        else await pullSequential(st, baseUrl, label, ctx);
     }
 
     function makeReporter(jobId, label, st) {
@@ -360,7 +628,11 @@
     async function downloadStream(url, totalHint, label, job, parentSignal, rt) {
         const jobId = job.jobId;
         const baseUrl = cleanStageURL(url);
-        const st = { chunks: [], bytes: 0, total: Math.max(0, Number(totalHint) || 0), probed: false };
+        const st = {
+            bytes: 0, total: Math.max(0, Number(totalHint) || 0),
+            probed: false, rangeMode: null, parallelChunks: null,
+            disk: await window.GDriveVideoDiskStorage.createStream(jobId, label)
+        };
         const report = makeReporter(jobId, label, st);
         let autoRestarts = 0;
 
@@ -375,10 +647,11 @@
                     markProgress: attempt.markProgress
                 });
 
-                const blob = new Blob(st.chunks, { type: 'video/mp4' });
-                if (blob.size !== st.bytes || st.bytes !== st.total || blob.size <= 0) {
-                    throw new Error(`${label} download incomplete (${blob.size} of ${st.total} bytes)`);
+                if (st.bytes !== st.total || st.bytes <= 0) {
+                    throw new Error(`${label} download incomplete (${st.bytes} of ${st.total} bytes)`);
                 }
+                const blob = await st.disk.finish();
+                if (blob.size !== st.bytes) throw new Error(`${label} temporary file was incomplete.`);
                 report(0, true);
                 return { blob, bytes: st.bytes, total: st.total };
             } catch (err) {
@@ -405,6 +678,7 @@
                     autoRestarts = 0;
                     continue;
                 }
+                await st.disk.abort();
                 throw err;
             } finally {
                 attempt.dispose();
@@ -477,6 +751,7 @@
             cancelledJobs.delete(jobId);
             try {
                 const job = { ...(await getJob(jobId)), jobId };
+                await window.GDriveVideoDiskStorage.prepare(jobId);
                 const sources = await downloadSourceStreams(job);
                 throwIfCancelled(jobId);
 
@@ -498,9 +773,14 @@
                     await window.GDriveVideoProcessor.process(job, sources.videoBlob, sources.audioBlob);
                 }
             } catch (error) {
+                await window.GDriveVideoDiskStorage.remove(jobId).catch(() => {});
+                const outOfSpace = error?.name === 'QuotaExceededError'
+                    || /quota exceeded|disk full|not enough space/i.test(String(error?.message || ''));
                 postStageMessage(isAbortError(error, jobId) ? 'videoStageCancelled' : 'videoStageError', {
                     jobId,
-                    message: error?.message || String(error)
+                    message: outOfSpace
+                        ? 'Not enough temporary disk storage. Free up disk space and retry.'
+                        : error?.message || String(error)
                 });
             } finally {
                 cancelledJobs.delete(jobId);
@@ -530,11 +810,19 @@
         run(jobId);
     }
 
-    chrome.runtime.onMessage.addListener(message => {
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         if (message?.target !== 'video-offscreen') return;
-        if (message.type === 'videoStageStart') run(message.jobId);
+        if (message.type === 'videoStageStart') {
+            if (!message.jobId) return sendResponse?.({ accepted: false });
+            // Acknowledge delivery immediately. The download itself reports its
+            // lifecycle separately, including any errors from getJob/fetch/remux.
+            sendResponse?.({ accepted: true });
+            void run(message.jobId);
+            return;
+        }
         if (message.type === 'videoStageCancelInternal') cancel(message.jobId);
         if (message.type === 'videoStageRestartInternal') restart(message.jobId);
+        sendResponse?.({ accepted: true });
     });
 
     window[NS] = { postStageMessage, throwIfCancelled, cancel };
