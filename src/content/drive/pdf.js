@@ -460,7 +460,69 @@
         return item;
     }
 
+    // Restore the simple Google Drive File-menu insertion from the last
+    // confirmed-working (v1.9.12) build. Classroom's additional checks only
+    // belong to embedded document viewers, never to a standalone Drive file.
+    function isStandaloneDriveFile() {
+        return app.isDrivePage?.() === true && window.top === window;
+    }
+
+    function standaloneDriveHasDocument() {
+        if (document.querySelector('video')) return false;
+        const title = String(document.title || '');
+        if (/\.(?:pdf|docx?|pptx?|odt|rtf)(?:$|[?#]|\s*-\s*Google Drive)/i.test(title)) return true;
+        const info = document.querySelector('#drive-active-item-info');
+        if (info?.textContent) {
+            try {
+                const data = JSON.parse(info.textContent);
+                const type = String(data?.mimeType || data?.mime_type || '');
+                const name = String(data?.title || data?.name || '');
+                if (DOCUMENT_MIME.test(type) || DOCUMENT_EXTENSION.test(name)) return true;
+                if (/^(?:video|audio)\//i.test(type)) return false;
+            } catch (_) { /* Drive does not always expose file metadata. */ }
+        }
+        if (document.querySelector('[aria-label*=".pdf" i], [title*=".pdf" i], [data-tooltip*=".pdf" i]')) return true;
+        return !!app.pdfCapture?.hasRenderedPages?.();
+    }
+
+    function scanStandaloneDriveMenu(menu) {
+        if (!document.body || !standaloneDriveHasDocument() || menu.querySelector(`#${MENU_ID}`)) return;
+        const nativeDownload = app.ui.findMenuRow(menu, 'Download');
+        const nativeDisabled = nativeDownload && (
+            nativeDownload.getAttribute('aria-disabled') === 'true' ||
+            nativeDownload.hasAttribute('disabled') ||
+            nativeDownload.dataset.disabled === 'true' ||
+            nativeDownload.classList.contains('disabled')
+        );
+        if (nativeDownload && !nativeDisabled) return;
+
+        // Same template order and placement as the user's working Drive build.
+        const templateRow = app.ui.findMenuRow(menu, 'Details') ||
+            app.ui.findMenuRow(menu, 'Add to starred') ||
+            app.ui.findMenuRow(menu, 'Security limitations') || nativeDownload;
+        if (!templateRow) return;
+        const item = app.ui.makeStandaloneMenuRow(templateRow, MENU_ID, 'Export');
+        if (!item) return;
+        app.ui.setDownloadMenuItemIcon(item);
+        app.ui.styleDownloadMenuItem(item);
+        app.ui.addMenuDescription(item, 'psd-pdf-menu-label',
+            'psd-pdf-menu-info', 'Drive Preview Exporter');
+        item.addEventListener('click', event => {
+            pdf.classroomMenuHandoff = false;
+            activateProtectedPDFDownload(event);
+        });
+        app.ui.handleMenuKeyboardActivation(item, event => {
+            pdf.classroomMenuHandoff = false;
+            activateProtectedPDFDownload(event);
+        });
+        app.ui.insertAfterReference(menu, item, app.ui.findShareRow(menu));
+    }
+
     function scanMenu(menu) {
+        if (isStandaloneDriveFile()) {
+            scanStandaloneDriveMenu(menu);
+            return;
+        }
         if (!document.body) return;
         const classroomMenu = isEmbeddedClassroomFileMenu(menu);
         if (!classroomMenu && !app.isDocumentViewer()) return;

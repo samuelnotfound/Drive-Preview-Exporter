@@ -20,6 +20,12 @@
     const RING_CIRCUMFERENCE = 2 * Math.PI * 17;
     const CAPTURE_PROGRESS_PERCENT = 90;
 
+    // Classroom needs document-switch verification. A standalone Drive file
+    // does not: use its original blob page slots rather than Classroom's
+    // stale-preview heuristics.
+    const usesClassicDriveCapture = () => app.isDrivePage?.() &&
+        !app.isClassroomViewer?.() && app.classroomPreviewTab !== true;
+
     pdf.runId ??= 0;
     pdf.cancelOverlayTimer ??= null;
 
@@ -175,6 +181,16 @@
     }
 
     function getPages({ probe = false } = {}) {
+        if (usesClassicDriveCapture()) {
+            const image = [...document.querySelectorAll('img[src^="blob:"]')].find(img =>
+                img.complete && img.naturalWidth >= MIN_WIDTH && img.naturalHeight >= MIN_HEIGHT);
+            const page = image?.parentElement;
+            const container = page?.parentElement;
+            if (page && container) return [...container.children].filter(candidate =>
+                sameClassSet(page, candidate));
+            // Some newer Drive viewers render on canvas. Use the generic
+            // detector only when the original blob-page layout is absent.
+        }
         syncDocumentContext();
         const groups = new Map();
         for (const image of document.querySelectorAll(IMAGE_SELECTOR)) {
@@ -275,6 +291,11 @@
     }
 
     function getPageImage(page) {
+        if (usesClassicDriveCapture()) {
+            const image = [...page.querySelectorAll('img[src^="blob:"]')].find(img =>
+                img.complete && img.naturalWidth >= MIN_WIDTH && img.naturalHeight >= MIN_HEIGHT);
+            if (image) return image;
+        }
         const images = [...page.querySelectorAll(IMAGE_SELECTOR)].filter(image =>
             isPageSurface(image) && (image.tagName === 'CANVAS' || image.complete) &&
             imageWidth(image) >= MIN_WIDTH && imageHeight(image) >= MIN_HEIGHT &&
@@ -386,6 +407,13 @@
     // fingerprints can reject a valid PDF simply because a lazy page redraws.
     // Page identity is checked at the moment it is encoded instead.
     function capturePageAt(pages, index, documentKey) {
+        if (usesClassicDriveCapture()) {
+            if (currentDocumentKey() !== documentKey || !pages[index]?.isConnected ||
+                pages[index].parentElement !== pages[0]?.parentElement) {
+                throw new Error('The Drive page list changed during capture.');
+            }
+            return pages[index];
+        }
         if (currentDocumentKey() !== documentKey || pdf.viewerNavigationPending) {
             throw new Error('The open document changed. Please export it again.');
         }
@@ -404,6 +432,7 @@
     async function capturePages(pages, runId) {
         const documentKey = currentDocumentKey();
         const capturedBlobSources = new Set();
+        const driveCapture = usesClassicDriveCapture();
         for (let index = 0; index < pages.length; index++) {
             if (!isCurrentRun(runId)) return false;
             const pageNumber = index + 1;
@@ -415,7 +444,8 @@
                 if (!isCurrentRun(runId)) return false;
                 try {
                     const page = capturePageAt(pages, index, documentKey);
-                    const image = await waitForPageImage(page, runId, capturedBlobSources);
+                    const image = await waitForPageImage(page, runId,
+                        driveCapture ? new Set() : capturedBlobSources);
                     if (!isCurrentRun(runId)) return false;
                     const before = pageFingerprint(page);
                     const jpeg = await imageToJPEG(image, runId);
@@ -423,12 +453,12 @@
                     const current = capturePageAt(pages, index, documentKey);
                     // The image may redraw or be replaced while JPEG encoding
                     // runs. Retry this page rather than failing all pages.
-                    if (current !== page || getPageImage(page) !== image ||
-                        pageFingerprint(page) !== before) {
+                    if (current !== page || (!driveCapture && (getPageImage(page) !== image ||
+                        pageFingerprint(page) !== before))) {
                         throw new Error('The PDF page changed while capturing.');
                     }
                     const source = blobSource(image);
-                    if (source && capturedBlobSources.has(source)) {
+                    if (!driveCapture && source && capturedBlobSources.has(source)) {
                         throw new Error('A previous page blob was reused.');
                     }
                     // Commit the page and its URL together. A placeholder

@@ -39,13 +39,16 @@
     };
     const isDrivePage = () => (location.hostname === 'drive.google.com' || location.hostname.endsWith('.drive.google.com')) && /^\/file(?:\/|$)/.test(location.pathname);
     // Classroom opens files in an embedded page viewer instead of a Drive /file tab.
+    // A top-level Drive file opened from a Classroom link has a Classroom
+    // referrer, but it is still a normal Drive viewer. Only embedded frames
+    // can inherit Classroom context from their referrer.
     const isClassroomViewer = () => location.hostname === 'classroom.google.com' ||
-        (location.hostname.endsWith('drive.google.com') && (() => {
+        (window.top !== window && location.hostname.endsWith('drive.google.com') && (() => {
             try { return new URL(document.referrer).hostname === 'classroom.google.com'; }
             catch (_) { return false; }
         })()) ||
         (location.hostname === 'docs.google.com' && /^\/(?:gview|viewer)/.test(location.pathname)) ||
-        (location.hostname.endsWith('.googleusercontent.com') &&
+        (window.top !== window && location.hostname.endsWith('.googleusercontent.com') &&
             /^(?:classroom|drive)\.google\.com$/.test((() => {
                 try { return new URL(document.referrer).hostname; } catch (_) { return ''; }
             })()));
@@ -262,19 +265,34 @@
 
     function setDownloadMenuItemIcon(item) {
         if (!item) return;
-        // Prefer an existing SVG slot; otherwise the first child that already holds an icon.
-        const host = item.querySelector('svg')?.parentElement || item.firstElementChild;
-        if (!host) return;
-        host.innerHTML = DOWNLOAD_ICON;
-        host.style.visibility = 'visible';
-        let p = host.parentElement;
-        while (p && p !== item) {
-            p.style.visibility = 'visible';
-            p = p.parentElement;
+        // Some Drive menu variants put the SVG directly inside the menu row
+        // (or have no icon at all). Replacing the icon's parent in those cases
+        // also deletes the "Export" label, making the command appear missing.
+        const originalIcon = item.querySelector('svg, img');
+        const icon = document.createElement('span');
+        icon.setAttribute('aria-hidden', 'true');
+        icon.className = 'psd-download-icon';
+        icon.style.cssText = 'display:inline-flex;flex:0 0 24px;width:24px;height:24px;align-items:center;justify-content:center;pointer-events:none;';
+        icon.innerHTML = DOWNLOAD_ICON_SVG;
+
+        const slot = originalIcon?.parentElement;
+        if (slot && slot !== item && !slot.textContent.trim() &&
+            slot.querySelectorAll('svg, img').length === 1) {
+            // The parent is an icon-only slot: preserve its native layout.
+            slot.replaceChildren(icon);
+        } else if (originalIcon) {
+            // Shared icon/text container: replace ONLY the icon node.
+            originalIcon.replaceWith(icon);
+        } else {
+            // Iconless template: insert a separate slot, never destroy text.
+            item.prepend(icon);
         }
+        icon.style.visibility = 'visible';
+        for (let node = icon.parentElement; node && node !== item; node = node.parentElement)
+            node.style.visibility = 'visible';
         const label = findPrimaryLabel(item);
         const color = label ? getComputedStyle(label).color : '';
-        if (color) host.style.color = color;
+        if (color) icon.style.color = color;
     }
     let menuStylesInstalled = false;
     function ensureMenuStyles() {
@@ -609,7 +627,16 @@
     }
 
     function scanDriveMenus() {
-        const menus = getVisibleFileMenus();
+        // The working Drive implementation scanned role=menu elements directly.
+        // Classroom's broader UL/menu discovery can select an inner list instead
+        // and hide the Share/Details row needed for standalone Drive insertion.
+        const driveMenus = app.isDrivePage() && window.top === window
+            ? [...document.querySelectorAll('[role="menu"]')].filter(menu => {
+                const rect = menu.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 &&
+                    getComputedStyle(menu).visibility !== 'hidden';
+            }) : [];
+        const menus = driveMenus.length ? driveMenus : getVisibleFileMenus();
         void app.video?.scanViewerState().catch(error => {
             console.warn('[Drive Preview Exporter] viewer state scan failed:', error);
         });
