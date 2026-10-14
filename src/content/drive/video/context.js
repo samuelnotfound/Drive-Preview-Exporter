@@ -35,6 +35,7 @@
         };
     }
 
+    /** Quality labels are cached; signed stream URLs are never cached as labels. */
     function normalizeQualityOptions(options = []) {
         return options.map(option => {
             const label = String(option?.text || option?.label || '').trim();

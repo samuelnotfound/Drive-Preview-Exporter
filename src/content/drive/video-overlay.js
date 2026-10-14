@@ -161,7 +161,6 @@
     font-variant-numeric: tabular-nums;
 }
 .psd-video-track-heading span:first-child { letter-spacing: .4px; }
-.psd-video-track-connections { color: #9da29f; font-size: 10px; margin-left: 8px; letter-spacing: 0; }
 .psd-video-track {
     position: relative;
     height: 9px;
@@ -319,11 +318,11 @@
           </div>
           <div id="psd-video-progress-tracks">
             <div class="psd-video-track-row" id="psd-video-row-video">
-              <div class="psd-video-track-heading"><span>VIDEO <span class="psd-video-track-connections" id="psd-video-connections-video">checking…</span></span><span id="psd-video-percent-video">0%</span></div>
+              <div class="psd-video-track-heading"><span>VIDEO</span><span id="psd-video-percent-video">0%</span></div>
               <div class="psd-video-track" id="psd-video-track-video" role="progressbar" aria-label="Video download" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
             </div>
             <div class="psd-video-track-row" id="psd-video-row-audio" style="display:none">
-              <div class="psd-video-track-heading"><span>AUDIO <span class="psd-video-track-connections" id="psd-video-connections-audio">checking…</span></span><span id="psd-video-percent-audio">0%</span></div>
+              <div class="psd-video-track-heading"><span>AUDIO</span><span id="psd-video-percent-audio">0%</span></div>
               <div class="psd-video-track" id="psd-video-track-audio" role="progressbar" aria-label="Audio download" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
             </div>
           </div>
@@ -365,7 +364,8 @@
             state.jobId = null;
             root.style.display = "none";
             announceLocalEnd();
-            if (jobId) {
+            // Closing the confirmation must not cancel a save already handed to Chrome.
+            if (jobId && state.stage !== 'started' && state.stage !== 'ready') {
                 try {
                     chrome.runtime.sendMessage({ type: "videoStageCancel", jobId });
                 } catch (_) {
@@ -517,13 +517,6 @@
         const total = chunks.enabled ? chunks.total : Math.max(stream.total, chunks.total);
         const percent = total ? Math.min(100, Math.floor(100 * stream.received / total)) : 0;
         if (percentLabel) percentLabel.textContent = `${percent}%`;
-        const connectionsLabel = root.querySelector(`#psd-video-connections-${label}`);
-        if (connectionsLabel) {
-            connectionsLabel.textContent = chunks.mode === 'parallel'
-                ? `${chunks.workers} connections`
-                : chunks.mode === 'single' ? '1 connection · no ranges' : 'checking…';
-            connectionsLabel.title = chunks.reason || '';
-        }
         track.setAttribute('aria-valuenow', String(percent));
         track.replaceChildren();
         if (!total) return;
@@ -659,19 +652,22 @@
             cancel.disabled = false;
             setLinearProgress(percent);
         }else if (stage === 'processing') {
-            title.textContent = 'Finalizing export';
-            info.textContent = 'Please wait..';
+            // The MP4 is ready. Keep the completed processing bar visible
+            // while Chrome prepares to accept the download.
+            title.textContent = 'Processing video';
+            info.textContent = 'Processing: 100%';
             cancel.style.display = 'inline-flex';
             cancel.disabled = false;
             root.classList.add('processing');
-            setLinearProgress(0);
+            setLinearProgress(100);
         }else if (stage === 'started') {
-            title.textContent = 'Export has started';
+            // Chrome accepted the save. Show the requested confirmation immediately;
+            // the background still tracks its actual completion and any failure.
+            title.textContent = 'Video downloaded';
             info.textContent = '';
             cancel.style.display = 'none';
-            // Chrome now owns the final file download. There is no reliable
-            // byte-progress event here, so start the linear bar at zero.
-            setLinearProgress(0);
+            root.classList.add('completed');
+            setLinearProgress(100);
         }else if (stage === 'ready') {
             title.textContent = 'Video downloaded';
             info.textContent = '';

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "version": "1.9.12",
+  "version": "1.9.47",
   "name": "Drive Preview Exporter",
-  "description": "Export view-only / protected Google Drive PDF and video previews.",
+  "description": "Export Google Drive and Classroom document previews as PDF, and Drive videos as MP4.",
   "update_url": "https://raw.githubusercontent.com/samuelnotfound/GDrive-Protected-File-Downloader/main/updates.xml",
   "permissions": [
     "tabs",
@@ -61,11 +61,56 @@
         "src/content/drive/video/quality-picker.js",
         "src/content/drive/video/bridge.js",
         "src/content/drive/video.js",
+        "src/content/drive/docs-auto-export.js",
         "src/content/drive/bootstrap.js"
       ],
       "run_at": "document_idle",
       "all_frames": true,
       "match_origin_as_fallback": true,
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://docs.google.com/document/*"
+      ],
+      "js": [
+        "src/content/docs/export-menu.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false,
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://classroom.google.com/*"
+      ],
+      "js": [
+        "src/content/shared/utils.js",
+        "src/content/drive/ui.js",
+        "src/content/drive/pdf/capture.js",
+        "src/content/drive/pdf/writer.js",
+        "src/content/drive/pdf.js",
+        "src/content/drive/bootstrap.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_origin_as_fallback": true,
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://docs.google.com/*"
+      ],
+      "js": [
+        "src/content/shared/utils.js",
+        "src/content/drive/ui.js",
+        "src/content/drive/pdf/capture.js",
+        "src/content/drive/pdf/writer.js",
+        "src/content/drive/pdf.js",
+        "src/content/drive/bootstrap.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
       "world": "ISOLATED"
     }
   ],

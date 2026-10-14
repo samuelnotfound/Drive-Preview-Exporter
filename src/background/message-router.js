@@ -1024,6 +1024,12 @@ async function handleVideoStageMessage({ request }) {
  * Map of actions keyed by `request.action`.
  */
 const ACTION_HANDLERS = Object.freeze({
+    beginGoogleDocExport: requireDriveTab(beginGoogleDocExport),
+    startClassroomPreviewExport: requireDriveTab(startClassroomPreviewExport),
+    isClassroomPreviewTab: requireDriveTab(isClassroomPreviewTab),
+    consumeGoogleDocExport: requireDriveTab(consumeGoogleDocExport),
+    finishGoogleDocExport: requireDriveTab(finishGoogleDocExport),
+    checkGoogleDocExport: requireDriveTab(checkGoogleDocExport),
     saveQualityPickerSnapshot: requireDriveTab(handleSaveQualityPickerSnapshot),
     loadQualityPickerSnapshot: requireDriveTab(handleLoadQualityPickerSnapshot),
     clearQualityPickerSnapshot: requireDriveTab(handleClearQualityPickerSnapshot),

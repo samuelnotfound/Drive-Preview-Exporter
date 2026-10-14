@@ -2,15 +2,44 @@
     const app = window.__PSD;
     const pdf = app.pdfState;
 
-    const IMAGE_SELECTOR = 'img[src^="blob:"]';
+    const IMAGE_SELECTOR = 'img[src^="blob:"], canvas';
+    const imageWidth = element => element.naturalWidth ?? element.width ?? 0;
+    const imageHeight = element => element.naturalHeight ?? element.height ?? 0;
     const MIN_WIDTH = 500;
     const MIN_HEIGHT = 300;
     const WAIT_FOR_VIEWER = 12000;
     const WAIT_FOR_IMAGE = 6000;
     const RING_CIRCUMFERENCE = 2 * Math.PI * 17;
+    const CAPTURE_PROGRESS_PERCENT = 90;
 
     pdf.runId ??= 0;
     pdf.cancelOverlayTimer ??= null;
+
+    function currentDocumentKey() {
+        const fileId = location.pathname.match(/\/file\/d\/([^/]+)/)?.[1] || '';
+        const filename = app.isClassroomViewer?.() ? String(pdf.currentExportFilename || '').trim() : '';
+        return [location.hostname, fileId || location.pathname, filename].join('|');
+    }
+
+    function pageFingerprint(page) {
+        return [...page.querySelectorAll(IMAGE_SELECTOR)].map(image => {
+            if (image.tagName === 'IMG') return image.currentSrc || image.src || '';
+            return `${image.width}x${image.height}`;
+        }).join('|');
+    }
+
+    function syncDocumentContext() {
+        const key = currentDocumentKey();
+        if (pdf.pageDocumentKey && key !== pdf.pageDocumentKey) {
+            // Keep the previous page elements only as a rejection set. The
+            // previous JPEG bytes are cleared separately by resetCaptureState.
+            pdf.stalePageElements = new Map(
+                [...(pdf.activePageElements || [])].map(page => [page, pageFingerprint(page)])
+            );
+        }
+        if (key !== pdf.pageDocumentKey) pdf.pageDocumentKey = key;
+        return key;
+    }
 
     const report = (status, detail, percent = null) =>
         app.ui.updateInPageOverlay(status, detail, percent);
@@ -49,10 +78,19 @@
         pdf.unsupportedTimer = setTimeout(() => app.ui.showInPageOverlay(false), 2000);
     }
 
-    function getFirstPageImage() {
-        return [...document.querySelectorAll(IMAGE_SELECTOR)].find(img =>
-            img.naturalWidth >= MIN_WIDTH && img.naturalHeight >= MIN_HEIGHT
-        ) || null;
+    // Classroom may keep the previous PDF in the DOM. Only use visibility
+    // to *rank* page groups: Google can render the current preview in a
+    // transitioning or virtualized container whose visibility is misleading.
+    function visibilityScore(element) {
+        if (!element?.isConnected) return 0;
+        let score = 2;
+        for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+            if (node.hidden || node.inert || node.getAttribute('aria-hidden') === 'true') return 0;
+            const style = getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden') return 0;
+            if (style.opacity === '0') score = Math.min(score, 1);
+        }
+        return score;
     }
 
     function sameClassSet(a, b) {
@@ -61,20 +99,52 @@
     }
 
     function getPages() {
-        const image = getFirstPageImage();
-        const page = image?.parentElement;
-        const container = page?.parentElement;
-        if (!page || !container) throw new Error('Could not find PDF pages');
+        syncDocumentContext();
+        const groups = new Map();
+        for (const image of document.querySelectorAll(IMAGE_SELECTOR)) {
+            if (imageWidth(image) < MIN_WIDTH || imageHeight(image) < MIN_HEIGHT) continue;
+            const page = image.parentElement;
+            const container = page?.parentElement;
+            if (!container || groups.has(container)) continue;
+            const pages = [...container.children].filter(candidate => sameClassSet(page, candidate));
+            if (!pages.length) continue;
+            groups.set(container, {
+                pages,
+                score: visibilityScore(image),
+                order: groups.size
+            });
+        }
+        // Prefer the latest fully visible viewer. If Google reports every
+        // page hidden during a transition, use the latest rendered group
+        // rather than treating a displayed document as unavailable.
+        const ranked = [...groups.values()].sort((a, b) =>
+            b.score - a.score || b.order - a.order);
+        if (!ranked.length) throw new Error('Could not find rendered document pages');
+        const stale = pdf.stalePageElements;
+        const fresh = stale?.size
+            ? ranked.map(group => ({
+                ...group,
+                pages: group.pages.filter(page =>
+                    !stale.has(page) || stale.get(page) !== pageFingerprint(page))
+            })).filter(group => group.pages.length)
+            : ranked;
+        if (!fresh.length) throw new Error('Waiting for the current document pages');
+        if (stale?.size) pdf.stalePageElements = null;
+        return fresh[0].pages;
+    }
 
-        return [...container.children].filter(candidate => sameClassSet(page, candidate));
+    function getFirstPageImage() {
+        try { return getPages().map(getPageImage).find(Boolean) || null; }
+        catch (_) { return null; }
     }
 
     function getPageImage(page) {
         return [...page.querySelectorAll(IMAGE_SELECTOR)].find(img =>
-            img.complete && img.naturalWidth >= MIN_WIDTH && img.naturalHeight >= MIN_HEIGHT
+            (img.tagName === 'CANVAS' || img.complete) && imageWidth(img) >= MIN_WIDTH && imageHeight(img) >= MIN_HEIGHT
         ) || null;
     }
 
+    /** Wait for a rendered page while respecting cancellation and timeouts. */
     function waitForImage(findImage, observeRoot, timeoutMs, errorMessage, runId, pollMs = 100) {
         const image = findImage();
         if (image) return Promise.resolve(image);
@@ -112,15 +182,15 @@
 
     function waitForFirstPage(runId) {
         return waitForImage(getFirstPageImage, document.body, WAIT_FOR_VIEWER,
-            'Could not find rendered PDF pages', runId, 150);
+            'Could not find rendered document pages', runId, 150);
     }
 
     async function imageToJPEG(image, runId) {
         if (!isCurrentRun(runId)) throw new Error('Capture cancelled.');
 
-        const width = image.naturalWidth;
-        const height = image.naturalHeight;
-        if (!image.complete || width < MIN_WIDTH || height < MIN_HEIGHT) {
+        const width = imageWidth(image);
+        const height = imageHeight(image);
+        if ((image.tagName !== 'CANVAS' && !image.complete) || width < MIN_WIDTH || height < MIN_HEIGHT) {
             throw new Error('A PDF page image is not ready.');
         }
 
@@ -161,27 +231,31 @@
             report(
                 'Capturing',
                 `Capturing page ${pageNumber} / ${pages.length}`,
-                (index / pages.length) * 50
+                (index / pages.length) * CAPTURE_PROGRESS_PERCENT
             );
 
             try {
+                if (getPages()[index] !== pages[index]) throw new Error('The open document changed. Please export it again.');
                 const image = await waitForPageImage(pages[index], runId);
                 const jpeg = await imageToJPEG(image, runId);
+                if (getPages()[index] !== pages[index]) throw new Error('The open document changed. Please export it again.');
                 pdf.capturedPages.set(pageNumber, jpeg);
+                report('Capturing', `Captured page ${pageNumber} / ${pages.length}`,
+                    (pageNumber / pages.length) * CAPTURE_PROGRESS_PERCENT);
             } catch (error) {
                 if (!isCurrentRun(runId)) return false;
 
                 report(
                     'Capture incomplete',
                     `Could not capture page ${pageNumber} / ${pages.length}`,
-                    (index / pages.length) * 50
+                    (index / pages.length) * CAPTURE_PROGRESS_PERCENT
                 );
                 console.warn('[Drive Media Saver] PDF page capture failed:', error);
                 return false;
             }
         }
 
-        report('Capturing', `Captured ${pages.length} pages`, 50);
+        report('Capturing', `Captured ${pages.length} pages`, CAPTURE_PROGRESS_PERCENT);
         return true;
     }
 
@@ -202,12 +276,26 @@
         }, 800);
     }
 
+    function resetForNewExport() {
+        // A second attachment can open without navigating the Classroom tab.
+        // Invalidate the previous job so it cannot finish and save old bytes.
+        pdf.stopRequested = true;
+        pdf.runId = (pdf.runId || 0) + 1;
+        pdf.status = 'idle';
+        resetCaptureState();
+        clearTimeout(pdf.cancelOverlayTimer);
+        clearTimeout(pdf.unsupportedTimer);
+        app.ui.showScrollDim(false);
+    }
+
     function beginCapture() {
         clearTimeout(pdf.cancelOverlayTimer);
+        clearTimeout(pdf.unsupportedTimer);
+        // Invalidate any previous capture before reading the current viewer.
+        resetCaptureState();
         const runId = ++pdf.runId;
         pdf.status = 'capturing';
         pdf.stopRequested = false;
-        resetCaptureState();
         resetProgressUI();
 
         const root = document.getElementById('psd-inpage-overlay');
@@ -230,8 +318,8 @@
     }
 
     async function prepare() {
-        if (pdf.status === 'capturing' || pdf.status === 'processing' || !app.isDrivePage()) return;
-        if (!app.pdf?.currentDriveFileIsPDF?.()) {
+        if (pdf.status === 'capturing' || pdf.status === 'processing' || !app.isDocumentViewer()) return;
+        if (!app.pdf?.isPageDocumentPreview?.()) {
             showUnsupportedFile();
             return;
         }
@@ -243,7 +331,8 @@
             if (!isCurrentRun(runId)) return;
 
             const pages = getPages();
-            if (!pages.length) throw new Error('Could not find PDF pages');
+            if (!pages.length) throw new Error('Could not find rendered pages');
+            pdf.activePageElements = new Set(pages);
 
             report('Preparing…', `Found ${pages.length} page${pages.length === 1 ? '' : 's'}`, 0);
             const captured = await capturePages(pages, runId);
@@ -268,7 +357,12 @@
 
     app.pdfCapture = {
         prepare,
+        resetForNewExport,
+        hasRenderedPages: () => {
+            try { return getPages().length > 0; } catch (_) { return false; }
+        },
         resetProgressUI,
+        captureProgressPercent: CAPTURE_PROGRESS_PERCENT,
         resetCaptureState,
         finishCancelledCapture,
         getOrderedCapturedPages: () =>

@@ -38,6 +38,18 @@
         } catch (_) {}
     };
     const isDrivePage = () => (location.hostname === 'drive.google.com' || location.hostname.endsWith('.drive.google.com')) && /^\/file(?:\/|$)/.test(location.pathname);
+    // Classroom opens files in an embedded page viewer instead of a Drive /file tab.
+    const isClassroomViewer = () => location.hostname === 'classroom.google.com' ||
+        (location.hostname.endsWith('drive.google.com') && (() => {
+            try { return new URL(document.referrer).hostname === 'classroom.google.com'; }
+            catch (_) { return false; }
+        })()) ||
+        (location.hostname === 'docs.google.com' && /^\/(?:gview|viewer)/.test(location.pathname)) ||
+        (location.hostname.endsWith('.googleusercontent.com') &&
+            /^(?:classroom|drive)\.google\.com$/.test((() => {
+                try { return new URL(document.referrer).hostname; } catch (_) { return ''; }
+            })()));
+    const isDocumentViewer = () => isDrivePage() || isClassroomViewer() || app.classroomPreviewTab === true;
     const isPDFBusy = () => pdf.status === 'capturing' || pdf.status === 'processing';
 
     const normalizeMenuText = value => String(value).replace(/\s+/g, ' ').trim();
@@ -76,11 +88,25 @@
     function findMenuRow(menu, wanted) {
         const target = normalizeMenuText(wanted).toLowerCase();
         const candidates = [
-            ...menu.querySelectorAll('[role="menuitem"]'),
-            ...menu.querySelectorAll('li'),
-            ...menu.querySelectorAll('[role="option"]')
+            ...menu.querySelectorAll('[role="menuitem"], [role="option"], li, button')
         ];
-        return candidates.find(el => el !== menu && getMenuLabel(el).toLowerCase() === target) || null;
+        const standard = candidates.find(el => el !== menu && getMenuLabel(el).toLowerCase() === target);
+        if (standard) return standard;
+
+        // Classroom's embedded viewer sometimes renders Material-menu labels
+        // without role="menuitem". The recorded viewer uses this label class.
+        const labels = [...menu.querySelectorAll('span.mUIrbf-vQzf8d')];
+        const label = labels.find(el => normalizeMenuText(el.textContent).toLowerCase() === target);
+        if (!label) return null;
+        let row = label;
+        while (row.parentElement && row.parentElement !== menu) {
+            const parent = row.parentElement;
+            const siblingLabels = [...parent.querySelectorAll('span.mUIrbf-vQzf8d')];
+            if (siblingLabels.some(el => el !== label &&
+                normalizeMenuText(el.textContent) !== normalizeMenuText(label.textContent))) break;
+            row = parent;
+        }
+        return row === label ? label.parentElement || label : row;
     }
     const findShareRow = menu => findMenuRow(menu, 'Share');
 
@@ -145,10 +171,50 @@
         return item;
     }
     function getVisibleFileMenus() {
-        return [...document.querySelectorAll('[role="menu"]')].filter(menu => {
-            const rect = menu.getBoundingClientRect?.();
-            return rect?.width > 0 && rect?.height > 0 && getComputedStyle(menu).visibility !== 'hidden';
+        const isVisible = el => {
+            const rect = el.getBoundingClientRect?.();
+            return rect?.width > 0 && rect?.height > 0 &&
+                getComputedStyle(el).visibility !== 'hidden';
+        };
+        // Look for a native Print action (possibly followed by Ctrl+P),
+        // rather than requiring exact labels for every command in the menu.
+        // The v1.9.27 direct-insertion build did not have that strict gate.
+        const action = row => {
+            const aria = normalizeMenuText(row.getAttribute('aria-label') || '');
+            const visible = normalizeMenuText(row.textContent || '');
+            for (const [name, pattern] of [
+                ['Print', /^Print(?=\s|Ctrl\s*\+\s*P|$)/i],
+                ['Details', /^Details(?=\s|D$|$)/i],
+                ['Open', /^Open(?=\W|$)/i]
+            ]) if (pattern.test(aria) || pattern.test(visible)) return name;
+            return '';
+        };
+        const nativeLists = [...document.querySelectorAll('ul')].filter(list => {
+            if (!isVisible(list)) return false;
+            const names = [...list.children].filter(row => row.tagName === 'LI').map(action);
+            return names.includes('Print') &&
+                (names.includes('Details') || names.includes('Open'));
         });
+        const menus = [...nativeLists];
+        for (const menu of document.querySelectorAll('[role="menu"], .goog-menu, #docs-file-menu')) {
+            if (isVisible(menu) && !nativeLists.some(list => menu.contains(list))) menus.push(menu);
+        }
+
+        // Compatibility with older, div-based embedded viewers.
+        for (const label of document.querySelectorAll('span.mUIrbf-vQzf8d')) {
+            if (normalizeMenuText(label.textContent) !== 'Print' || !isVisible(label)) continue;
+            let parent = label.parentElement;
+            for (let depth = 0; parent && depth < 12; depth++, parent = parent.parentElement) {
+                if (!isVisible(parent)) break;
+                const texts = new Set([...parent.querySelectorAll('span.mUIrbf-vQzf8d')]
+                    .map(el => normalizeMenuText(el.textContent)));
+                if (['Open', 'Details', 'Print'].every(text => texts.has(text))) {
+                    if (!menus.some(menu => menu.contains(parent) || parent.contains(menu))) menus.push(parent);
+                    break;
+                }
+            }
+        }
+        return menus;
     }
     function getDriveFileButton() {
         return [...document.querySelectorAll('[role="button"],button')].find(el => {
@@ -185,12 +251,13 @@
         return false;
     }
 
-    const DOWNLOAD_ICON = [
-        '<span aria-hidden="true">',
+    // One download icon for Drive and Classroom menu actions.
+    const DOWNLOAD_ICON_SVG = [
         '<svg height="24" viewBox="0 96 960 960" width="24" fill="currentColor">',
         '<path fill="currentColor" d="M240 896q-33 0-56.5-23.5T160 816V696h80v120h480V696h80v120q0 33-23.5 56.5T720 896H240Zm240-160L280 536l56-58 104 104V256h80v326l104-104 56 58-200 200Z"></path>',
-        '</svg></span>'
+        '</svg>'
     ].join('');
+    const DOWNLOAD_ICON = `<span aria-hidden="true">${DOWNLOAD_ICON_SVG}</span>`;
 
     function setDownloadMenuItemIcon(item) {
         if (!item) return;
@@ -208,15 +275,44 @@
         const color = label ? getComputedStyle(label).color : '';
         if (color) host.style.color = color;
     }
+    let menuStylesInstalled = false;
+    function ensureMenuStyles() {
+        if (menuStylesInstalled || document.getElementById('psd-menu-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'psd-menu-styles';
+        style.textContent = `
+            [data-psd-menu-item="true"] {
+                background-color: transparent;
+                color: inherit;
+                -webkit-text-fill-color: currentColor;
+            }
+            [data-psd-menu-item="true"]:hover,
+            [data-psd-menu-item="true"]:focus-visible,
+            [data-psd-menu-item="true"].goog-menuitem-highlight {
+                background-color: color-mix(in srgb, currentColor 9%, transparent) !important;
+                background-image: none !important;
+            }
+            [data-psd-menu-item="true"]:focus-visible { outline: none !important; }
+            [data-psd-menu-item="true"] .psd-menu-description {
+                display: block;
+                margin-top: 2px;
+                color: color-mix(in srgb, currentColor 68%, transparent);
+                -webkit-text-fill-color: color-mix(in srgb, currentColor 68%, transparent);
+                font: 400 .78em/1.2 Roboto, Arial, sans-serif;
+                white-space: nowrap;
+            }
+        `;
+        (document.head || document.documentElement).append(style);
+        menuStylesInstalled = true;
+    }
     function styleDownloadMenuItem(item, opacity = '1') {
+        ensureMenuStyles();
+        item.dataset.psdMenuItem = 'true';
         item.style.cursor = 'pointer';
         item.style.opacity = opacity;
         item.style.pointerEvents = 'auto';
-        item.style.transition = 'background-color 80ms ease, opacity 80ms ease';
         item.style.boxSizing = 'border-box';
         item.style.maxWidth = '100%';
-        item.addEventListener('mouseenter', () => { item.style.backgroundColor = 'rgba(255,255,255,.08)'; });
-        item.addEventListener('mouseleave', () => { item.style.backgroundColor = ''; });
     }
     function handleMenuKeyboardActivation(item, activate) {
         item.addEventListener('keydown', event => {
@@ -230,9 +326,10 @@
         const parent = label.parentElement;
         if (!parent) return;
         const info = Object.assign(document.createElement('span'), { className: infoClass, textContent: text });
-        info.style.cssText = 'display:block;box-sizing:border-box;width:100%;max-width:100%;margin-top:2px;font:400 11px/14px Roboto,Arial,sans-serif;color:rgba(255,255,255,.62);white-space:normal;overflow-wrap:anywhere;word-break:normal;overflow:hidden;';
+        info.classList.add('psd-menu-description');
+        info.style.cssText = 'box-sizing:border-box;width:100%;max-width:100%;white-space:normal;overflow-wrap:anywhere;word-break:normal;overflow:hidden;';
         parent.append(info);
-        Object.assign(parent.style, { display:'flex', flexDirection:'column', alignItems:'flex-start', flex:'1 1 0', width:'0', minWidth:'0', maxWidth:'100%', overflow:'hidden' });
+        Object.assign(parent.style, { display:'flex', flexDirection:'column', alignItems:'flex-start', flex:'1 1 0', width:'0', minWidth:'0', maxWidth:'100%', overflow:'hidden', justifyContent:'center' });
     }
 
     const INPAGE_OVERLAY_HTML = `
@@ -402,9 +499,12 @@
             app.video?.scanMenu(menu);
             app.pdf?.scanMenu(menu);
         }
+        app.pdf?.updateClassroomHeaderButton?.();
     }
+    let watchingMenus = false;
     function watchDriveMenus() {
-        if (!isDrivePage()) return;
+        if (!isDocumentViewer() || watchingMenus) return;
+        watchingMenus = true;
         scanDriveMenus();
         let scanTimer = null;
         const scheduleScan = () => {
@@ -416,18 +516,21 @@
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['aria-hidden']
+            attributeFilter: ['aria-hidden', 'aria-expanded', 'class', 'style']
         });
         setInterval(scheduleScan, 1000);
     }
 
     app.sendAction = sendAction;
     app.isDrivePage = isDrivePage;
+    app.isClassroomViewer = isClassroomViewer;
+    app.isDocumentViewer = isDocumentViewer;
     app.ui = {
         ownText,
         findLabel,
         findPrimaryLabel,
         getMenuLabel,
+        getVisibleFileMenus,
         findMenuRow,
         findShareRow,
         insertAfterReference,
@@ -436,6 +539,7 @@
         getDriveFileButton,
         closeDriveFileMenu,
         setDownloadMenuItemIcon,
+        downloadIconSvg: DOWNLOAD_ICON_SVG,
         styleDownloadMenuItem,
         handleMenuKeyboardActivation,
         addMenuDescription,
@@ -446,14 +550,28 @@
     };
 
     app.init = function init() {
-        app.video?.init();
-        if (!app.isDrivePage()) return;
+        if (app.isDrivePage()) app.video?.init();
+        const enableDocumentViewer = () => {
+            createInPageOverlay();
+            void app.startPendingDocsExport?.();
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', watchDriveMenus, { once: true });
+            } else {
+                watchDriveMenus();
+            }
+        };
+        if (app.isDocumentViewer()) enableDocumentViewer();
 
-        createInPageOverlay();
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', watchDriveMenus, { once: true });
-        } else {
-            watchDriveMenus();
+        // Some Classroom attachment frames have a Docs/Drive URL that is not
+        // /file/d/... and whose referrer is not Classroom. Ask the service worker
+        // about the containing tab before injecting anything into that frame.
+        if (window.top !== window && /^(?:docs\.google\.com|(?:[\w-]+\.)?drive\.google\.com|[\w.-]+\.googleusercontent\.com)$/.test(location.hostname)) {
+            void chrome.runtime.sendMessage({ action: 'isClassroomPreviewTab' }).then(reply => {
+                if (!reply?.classroom) return;
+                app.classroomPreviewTab = true;
+                if (!watchingMenus) enableDocumentViewer();
+                else scanDriveMenus();
+            }).catch(() => {});
         }
     };
 })();

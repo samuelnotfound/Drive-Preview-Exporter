@@ -6,8 +6,19 @@
         app.ui.updateInPageOverlay(status, detail, percent);
 
     function getDownloadFilename() {
-        let title = document.querySelector('meta[itemprop="name"]')?.content || document.title || 'download.pdf';
+        // In Classroom, the browser tab is usually named "Google Classroom".
+        // Prefer the open preview's visible document heading when available.
+        const preview = document.querySelector('[role="dialog"][aria-modal="true"], [role="dialog"]');
+        const previewTitle = app.isClassroomViewer?.() && (preview || document)
+            .querySelector('[data-file-name], [data-document-title], [role="heading"], h1')?.textContent?.trim();
+        let title = pdf.currentExportFilename || previewTitle ||
+            document.querySelector('meta[itemprop="name"]')?.content ||
+            document.title || 'download.pdf';
+        if (app.isClassroomViewer?.() && /^Google Classroom(?:\s*[-|].*)?$/i.test(title)) {
+            title = 'Classroom document';
+        }
         title = title.replace(/\s*-\s*Google Drive\s*$/i, '').trim();
+        title = title.replace(/\.(?:docx?|odt|rtf|pptx?)$/i, '');
         if (!/\.pdf$/i.test(title)) title += '.pdf';
         return title.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
     }
@@ -119,6 +130,7 @@
 
         const pages = app.pdfCapture.getOrderedCapturedPages();
         const writer = createWriter(pages.length);
+        const captureProgress = app.pdfCapture.captureProgressPercent;
 
         app.ui.showScrollDim(false);
         const actions = document.querySelector('#psd-inpage-actions');
@@ -134,8 +146,11 @@
             for (let index = 0; index < pages.length; index++) {
                 if (runId !== pdf.runId || pdf.stopRequested) return;
 
-                report('Processing', `Processing page ${index + 1} / ${pages.length}`, 50 + (index / pages.length) * 50);
                 writer.addPage(index, pages[index]);
+                report('Processing', `Processing page ${index + 1} / ${pages.length}`,
+                    captureProgress + ((index + 1) / pages.length) * (99 - captureProgress));
+                // Give the browser a chance to paint progress during longer exports.
+                if ((index + 1) % 8 === 0) await new Promise(resolve => setTimeout(resolve, 0));
             }
 
             if (runId !== pdf.runId || pdf.stopRequested) return;
@@ -156,7 +171,9 @@
             app.pdfCapture.resetCaptureState();
             app.ui.updateWindowControl();
             report('File exported', '', 100);
-            showCompletedOverlay();
+            // Let the progress ring finish its transition before showing the checkmark.
+            await new Promise(resolve => setTimeout(resolve, 180));
+            if (runId === pdf.runId && pdf.status === 'completed') showCompletedOverlay();
         } catch (error) {
             if (runId !== pdf.runId || pdf.stopRequested) return;
 

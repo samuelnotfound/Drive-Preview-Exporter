@@ -10,6 +10,8 @@ importScripts(
     'background/quality-state.js',
     'background/quality-automation.js',
     'background/quality-scan.js',
+    'background/docs-export.js',
+    'background/classroom-export.js',
     'background/message-router.js',
     'background/lifecycle.js'
 );
