@@ -50,7 +50,8 @@
                 try { return new URL(document.referrer).hostname; } catch (_) { return ''; }
             })()));
     const isDocumentViewer = () => isDrivePage() || isClassroomViewer() || app.classroomPreviewTab === true;
-    const isPDFBusy = () => pdf.status === 'capturing' || pdf.status === 'processing';
+    const isPDFBusy = () => pdf.status === 'capturing' || pdf.status === 'processing' ||
+        pdf.classroomExportHandoff === true || pdf.classroomUiActive === true;
 
     const normalizeMenuText = value => String(value).replace(/\s+/g, ' ').trim();
 
@@ -289,7 +290,12 @@
             [data-psd-menu-item="true"]:hover,
             [data-psd-menu-item="true"]:focus-visible,
             [data-psd-menu-item="true"].goog-menuitem-highlight {
-                background-color: color-mix(in srgb, currentColor 9%, transparent) !important;
+                background-color: var(--psd-menu-hover-fill, rgba(0,0,0,.08)) !important;
+                background-image: none !important;
+            }
+            [data-psd-classroom-export="true"]:hover > div,
+            [data-psd-classroom-export="true"].goog-menuitem-highlight > div {
+                background: transparent !important;
                 background-image: none !important;
             }
             [data-psd-menu-item="true"]:focus-visible { outline: none !important; }
@@ -305,9 +311,23 @@
         (document.head || document.documentElement).append(style);
         menuStylesInstalled = true;
     }
-    function styleDownloadMenuItem(item, opacity = '1') {
+    function getMenuHoverFill(item) {
+        for (let element = item?.parentElement; element; element = element.parentElement) {
+            const background = getComputedStyle(element).backgroundColor;
+            const channels = background.match(/[\d.]+/g)?.map(Number);
+            if (!channels || channels.length < 3 || (channels.length > 3 && channels[3] === 0)) continue;
+            const [red, green, blue] = channels;
+            const luminance = (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
+            return luminance < 0.45 ? 'rgba(255,255,255,.10)' : 'rgba(0,0,0,.08)';
+        }
+        return 'rgba(0,0,0,.08)';
+    }
+    function styleDownloadMenuItem(item, opacity = '1', fillReference = item) {
         ensureMenuStyles();
         item.dataset.psdMenuItem = 'true';
+        // The custom row is styled before insertion, so use its native
+        // neighbor to determine whether the menu background is light or dark.
+        item.style.setProperty('--psd-menu-hover-fill', getMenuHoverFill(fillReference));
         item.style.cursor = 'pointer';
         item.style.opacity = opacity;
         item.style.pointerEvents = 'auto';
@@ -366,7 +386,13 @@
 #psd-inpage-overlay.completed #psd-inpage-detail { display:none }
 #psd-inpage-overlay.completed #psd-inpage-head { grid-template-columns:36px minmax(0,1fr) 28px; column-gap:14px }
 #psd-inpage-overlay.completed #psd-inpage-close { display:block; position:static; grid-column:3; grid-row:1; width:28px; height:28px; line-height:28px; margin:0; text-align:center }
+#psd-inpage-overlay.cancelled #psd-inpage-close { display:block;position:static;grid-column:3;grid-row:1 }
+#psd-inpage-overlay.cancelled #psd-inpage-head { grid-template-columns:36px minmax(0,1fr) 28px }
+#psd-inpage-overlay.error #psd-inpage-close { display:block;position:static;grid-column:3;grid-row:1 }
+#psd-inpage-overlay.error #psd-inpage-head { grid-template-columns:36px minmax(0,1fr) 28px }
 #psd-inpage-overlay.cancelled #psd-inpage-title { font-size:16px; line-height:20px; white-space:nowrap }
+#psd-inpage-overlay.error #psd-inpage-spinner,#psd-inpage-overlay.error #psd-inpage-actions { display:none }
+#psd-inpage-overlay.error #psd-inpage-close { display:block }
       </style>
       <div id="psd-inpage-card"><div id="psd-inpage-body"><div id="psd-inpage-head">
         <div id="psd-inpage-spinner" aria-hidden="true"><svg viewBox="0 0 40 40"><circle class="psd-ring-bg" cx="20" cy="20" r="17"></circle><circle id="psd-inpage-ring" class="psd-ring" cx="20" cy="20" r="17"></circle></svg></div>
@@ -386,21 +412,33 @@
         const cancelButton = root.querySelector('#psd-inpage-toggle');
         const closeButton = root.querySelector('#psd-inpage-close');
         cancelButton.onclick = () => {
-            if (!isPDFBusy()) return;
-            root.querySelector('#psd-inpage-title')?.replaceChildren(document.createTextNode('Cancelling export'));
+            // A job can still be waiting for a frame and show `idle` locally.
+            // Do not gate the only Cancel control on a local busy flag.
+            if (root.classList.contains('completed') || root.classList.contains('cancelled') ||
+                root.classList.contains('error')) return;
+            // The top Classroom frame owns the button but a child frame owns
+            // the capture. Never treat the top frame's idle capture as a noop.
+            const classroomJob = pdf.classroomUiActive || pdf.classroomExportHandoff ||
+                (app.isClassroomViewer?.() && Boolean(pdf.classroomJobId));
+            if (classroomJob) {
+                // Mark dismissed before any async messaging. Old progress from
+                // the frame search must not reopen this card after Cancel.
+                pdf.dismissedClassroomJobId = pdf.classroomJobId || '';
+                void chrome.runtime.sendMessage({
+                    action: 'cancelClassroomPreviewExport', jobId: pdf.classroomJobId || ''
+                }).catch(() => {});
+            }
             app.pdf?.cancel?.();
+            // Hide immediately, without waiting for the service worker or
+            // showing a lingering 'Export cancelled' state.
+            showScrollDim(false);
+            showInPageOverlay(false);
         };
         closeButton.onclick = () => {
-            if (!isPDFBusy()) {
-                showInPageOverlay(false);
-                return;
-            }
-            if (pdf.stopRequested) return;
-            root.classList.remove('completed', 'unsupported', 'cancelled');
-            root.querySelector('#psd-inpage-title')?.replaceChildren(document.createTextNode('Cancelling export'));
-            app.pdf?.cancel?.();
-            const detail = root.querySelector('#psd-inpage-detail');
-            if (detail) detail.textContent = '';
+            // Close is only for a terminal state, never a second Cancel button.
+            if (isPDFBusy() && !root.classList.contains('completed') &&
+                !root.classList.contains('cancelled') && !root.classList.contains('error')) return;
+            showInPageOverlay(false);
         };
     }
     const SCROLL_MESSAGE = `<div id="psd-scroll-dim-msg" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:min(420px,calc(100vw - 48px));text-align:center;pointer-events:none;user-select:none;">
@@ -430,9 +468,16 @@
         const root = document.getElementById('psd-inpage-overlay');
         if (root && isPDFBusy()) root.classList.remove('idle', 'cancelled');
     }
-    function showScrollDim(show = true) {
+    function showScrollDim(show = true, temporaryFrame = false) {
         const dim = document.getElementById('psd-scroll-dim');
         if (!dim) return;
+        // A click inside an embedded viewer must block that viewer immediately.
+        // Once the Classroom parent acknowledges its own lock, the temporary
+        // iframe lock is removed so the page is never dimmed twice.
+        if (window.top !== window && !temporaryFrame) {
+            dim.style.display = 'none';
+            return;
+        }
         if (show && !dim.querySelector('#psd-scroll-dim-msg')) {
             dim.innerHTML = SCROLL_MESSAGE;
         }
@@ -442,11 +487,20 @@
         createInPageOverlay();
         const root = document.getElementById('psd-inpage-overlay');
         if (!root) return;
+        // The Classroom parent shows one progress card for the active job.
+        // Never show an extra card in the embedded PDF frame.
+        if (window.top !== window && (app.isClassroomViewer?.() ||
+            app.classroomPreviewTab || pdf.classroomExportHandoff)) {
+            root.style.display = 'none';
+            return;
+        }
         root.style.display = show ? 'block' : 'none';
         if (show) {
-            root.classList.remove('cancelled', 'completed', 'unsupported');
+            root.classList.remove('cancelled', 'completed', 'unsupported', 'error');
             root.querySelector('#psd-inpage-spinner')?.style.setProperty('display', 'block');
             root.querySelector('#psd-inpage-check')?.style.setProperty('display', 'none');
+            // Remove inline display left by the previous completed/error job.
+            root.querySelector('#psd-inpage-close')?.style.setProperty('display', 'none');
             root.querySelector('#psd-inpage-actions')?.style.setProperty('display', 'flex');
             const toggle = root.querySelector('#psd-inpage-toggle');
             if (toggle) {
@@ -457,8 +511,71 @@
         }
         updateWindowControl();
     }
+    // A Classroom tab can reuse its PDF viewer for another attachment. Clear
+    // only the finished card when the attachment changes; leave the last file
+    // signature and name available for stale-page checks.
+    function dismissFinishedClassroomOverlay() {
+        const root = document.getElementById('psd-inpage-overlay');
+        if (isPDFBusy()) return;
+        if (root && (root.classList.contains('completed') ||
+            root.classList.contains('cancelled') || root.classList.contains('error'))) {
+            pdf.dismissedClassroomJobId = pdf.classroomJobId || '';
+            pdf.classroomJobId = '';
+            pdf.currentExportFilename = '';
+            pdf.status = 'idle';
+            showScrollDim(false);
+            showInPageOverlay(false);
+        }
+    }
+
+    function completeInPageOverlay() {
+        const root = document.getElementById('psd-inpage-overlay');
+        if (!root) return;
+        showScrollDim(false);
+        root.classList.remove('cancelled', 'unsupported');
+        root.classList.add('completed');
+        root.querySelector('#psd-inpage-spinner')?.style.setProperty('display', 'none');
+        root.querySelector('#psd-inpage-check')?.style.setProperty('display', 'block');
+        root.querySelector('#psd-inpage-actions')?.style.setProperty('display', 'none');
+        root.querySelector('#psd-inpage-close')?.style.setProperty('display', 'block');
+        root.querySelector('#psd-inpage-title')?.replaceChildren(document.createTextNode('File exported'));
+        root.querySelector('#psd-inpage-detail')?.replaceChildren();
+        pdf.classroomExportHandoff = false;
+        pdf.classroomUiActive = false;
+    }
+    // A failed PDF export should never leave a notification over the viewer.
+    // Retain the job ID as dismissed so a delayed frame message cannot bring it back.
+    function failInPageOverlay(_status, _detail) {
+        if (pdf.classroomJobId) pdf.dismissedClassroomJobId = pdf.classroomJobId;
+        pdf.status = 'idle';
+        pdf.stopRequested = true;
+        pdf.classroomExportHandoff = false;
+        pdf.classroomUiActive = false;
+        pdf.capturedPages?.clear();
+        showScrollDim(false);
+        showInPageOverlay(false);
+    }
+    function cancelInPageOverlay() {
+        const root = document.getElementById('psd-inpage-overlay');
+        if (!root) return;
+        showScrollDim(false);
+        root.classList.remove('completed', 'unsupported', 'error');
+        root.classList.add('cancelled');
+        root.querySelector('#psd-inpage-title')?.replaceChildren(document.createTextNode('Export cancelled'));
+        root.querySelector('#psd-inpage-actions')?.style.setProperty('display', 'none');
+        root.querySelector('#psd-inpage-close')?.style.setProperty('display', 'block');
+        pdf.classroomExportHandoff = false;
+        pdf.classroomUiActive = false;
+    }
     const INPAGE_RING_CIRCUMFERENCE = 2 * Math.PI * 17;
     function updateInPageOverlay(status, detail, percent) {
+        // Page-capture and PDF-assembly errors are silent. Reporters may still
+        // send the failure to the background for cleanup and diagnostics.
+        if (/^(?:Capture incomplete|PDF conversion failed|PDF incomplete|Some pages were not captured|Preview unavailable)$/i
+            .test(String(status || ''))) {
+            failInPageOverlay(status, detail);
+            return;
+        }
         const root = document.getElementById('psd-inpage-overlay');
         if (!root) return;
         const title = root.querySelector('#psd-inpage-title');
@@ -468,6 +585,7 @@
             if (/^File exported$/i.test(label)) title.textContent = 'File exported';
             else if (/^PDF conversion failed$/i.test(label)) title.textContent = 'PDF conversion failed';
             else if (/^PDF incomplete$/i.test(label)) title.textContent = 'PDF incomplete';
+            else if (/^Capture incomplete$/i.test(label)) title.textContent = 'Capture incomplete';
             else if (/^Some pages were not captured$/i.test(label)) title.textContent = 'Capture incomplete';
             else title.textContent = 'Preparing export';
         }
@@ -546,6 +664,10 @@
         showScrollDim,
         showInPageOverlay,
         updateInPageOverlay,
+        completeInPageOverlay,
+        failInPageOverlay,
+        cancelInPageOverlay,
+        dismissFinishedClassroomOverlay,
         updateWindowControl
     };
 

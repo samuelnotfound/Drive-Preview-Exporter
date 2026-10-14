@@ -91,6 +91,16 @@
         const candidates = [];
         const selectors = '[data-file-name],[data-document-title],h1,h2,[role="heading"],span[title],span[aria-label],span';
         for (const element of document.querySelectorAll(selectors)) {
+            // Classroom may leave the previous document's title mounted. A
+            // hidden or transitioning header is not the active attachment.
+            let hidden = false;
+            for (let node = element; node?.nodeType === 1; node = node.parentElement) {
+                const style = getComputedStyle(node);
+                if (node.hidden || node.inert || node.getAttribute('aria-hidden') === 'true' ||
+                    style.display === 'none' || style.visibility === 'hidden' ||
+                    style.opacity === '0') { hidden = true; break; }
+            }
+            if (hidden) continue;
             const bounds = element.getBoundingClientRect();
             if (!bounds.width || !bounds.height || bounds.top < 0 || bounds.top > 190 ||
                 bounds.left < 0 || bounds.left >= innerWidth) continue;
@@ -110,14 +120,93 @@
         return fileExtension.test(document.title.trim()) ? document.title.trim() : '';
     }
 
+    const CLASSROOM_LOCK_MESSAGE = 'dpe-classroom-export-lock-v1';
+    const CLASSROOM_LOCK_READY = 'dpe-classroom-export-lock-ready-v1';
+
+    // The menu may be inside a cross-origin Drive iframe. Message the Classroom
+    // top frame directly instead of waiting for the background frame scanner.
+    // The iframe covers itself temporarily until the parent confirms the lock.
+    window.addEventListener('message', event => {
+        if (event.data?.type === CLASSROOM_LOCK_READY && window.top !== window &&
+            event.origin === 'https://classroom.google.com' &&
+            event.source === window.top &&
+            event.data.jobId === pdf.temporaryClassroomLockJobId) {
+            pdf.temporaryClassroomLockJobId = '';
+            app.ui.showScrollDim(false);
+            return;
+        }
+        if (event.data?.type !== CLASSROOM_LOCK_MESSAGE || window.top !== window ||
+            location.hostname !== 'classroom.google.com' || event.source === window ||
+            !/^https:\/\/(?:classroom|docs|drive)\.google\.com$|^https:\/\/[\w.-]+\.googleusercontent\.com$/.test(event.origin)) return;
+        const jobId = String(event.data.jobId || '');
+        if (!/^[0-9]{10,16}-[a-z0-9]{4,16}$/.test(jobId)) return;
+        pdf.classroomJobId = jobId;
+        pdf.dismissedClassroomJobId = '';
+        pdf.classroomUiActive = true;
+        pdf.classroomExportHandoff = true;
+        pdf.stopRequested = false;
+        app.ui.showInPageOverlay(true);
+        app.ui.showScrollDim(true);
+        app.ui.updateInPageOverlay('Preparing export', '', 0);
+        try {
+            event.source.postMessage({ type: CLASSROOM_LOCK_READY, jobId }, event.origin);
+        } catch (_) { /* The viewer may have navigated. */ }
+    });
+
+    function lockClassroomOnClick(jobId) {
+        if (window.top === window) {
+            app.ui.showScrollDim(true);
+            return;
+        }
+        // This call is synchronous with the click. It prevents interacting
+        // with the embedded preview before the parent has drawn its dimmer.
+        pdf.temporaryClassroomLockJobId = jobId;
+        app.ui.showScrollDim(true, true);
+        try {
+            window.top.postMessage({ type: CLASSROOM_LOCK_MESSAGE, jobId },
+                'https://classroom.google.com');
+        } catch (_) { /* Background progress relay remains the fallback. */ }
+    }
+
     function activateProtectedPDFDownload(event) {
         event.preventDefault();
         event.stopPropagation();
         // Capture the name before closing the menu or changing the viewer.
-        pdf.currentExportFilename = app.isClassroomViewer() ? getCurrentPreviewFilename() : '';
+        const inClassroom = app.isClassroomViewer() || app.classroomPreviewTab === true ||
+            pdf.classroomMenuHandoff === true;
+        pdf.currentExportFilename = app.isClassroomViewer() &&
+            location.hostname === 'classroom.google.com' ? getCurrentPreviewFilename() : '';
+        pdf.classroomExportHandoff = inClassroom;
+        pdf.classroomJobId = inClassroom
+            ? `${Date.now()}-${Math.random().toString(36).slice(2)}` : '';
+        pdf.classroomUiActive = inClassroom;
+        pdf.dismissedClassroomJobId = '';
         app.ui.closeDriveFileMenu();
         app.pdfCapture?.resetForNewExport?.();
+        // The new job is active; only Cancel should flip this flag back.
+        pdf.stopRequested = false;
         app.ui.showInPageOverlay(true);
+        // Lock immediately on the click, before asynchronous title resolution,
+        // frame discovery or the service worker can delay the progress card.
+        if (inClassroom) lockClassroomOnClick(pdf.classroomJobId);
+        else app.ui.showScrollDim(true);
+        if (inClassroom) {
+            void chrome.runtime.sendMessage({
+                action: 'classroomExportProgress',
+                status: 'Preparing export',
+                detail: '',
+                filename: pdf.currentExportFilename || '',
+                percent: 0, jobId: pdf.classroomJobId
+            }).then(reply => {
+                // If the fast window message was missed but the background
+                // successfully displayed the parent overlay, release the
+                // temporary iframe lock as well.
+                if (reply?.success && pdf.temporaryClassroomLockJobId === pdf.classroomJobId) {
+                    pdf.temporaryClassroomLockJobId = '';
+                    app.ui.showScrollDim(false);
+                }
+            }).catch(() => {});
+        }
 
         const root = document.getElementById('psd-inpage-overlay');
         root?.classList.remove('quiet', 'idle', 'completed', 'cancelled');
@@ -436,7 +525,10 @@
                 item, 'psd-pdf-menu-label', 'psd-pdf-menu-info', 'Drive Preview Exporter'
             );
         }
-        app.ui.styleDownloadMenuItem(item);
+        app.ui.styleDownloadMenuItem(item, '1', classroomMenu ? printRow : templateRow);
+        if (classroomMenu) {
+            item.dataset.psdClassroomExport = 'true';
+        }
         const activate = event => {
             pdf.classroomMenuHandoff = classroomMenu;
             activateProtectedPDFDownload(event);
@@ -493,31 +585,53 @@
     }
 
     async function start() {
+        const jobId = pdf.classroomJobId || '';
+        const navigationPending = pdf.viewerNavigationPending === true;
+        const navigationFingerprints = pdf.viewerNavigationFingerprints || null;
         const needsClassroomHandoff = pdf.classroomMenuHandoff ||
             (app.isClassroomViewer() && location.hostname === 'classroom.google.com');
+        const receivedClassroomCapture = pdf.classroomCaptureHandoffReceived === true;
+        pdf.classroomCaptureHandoffReceived = false;
         pdf.classroomMenuHandoff = false;
-        if (needsClassroomHandoff && !app.pdfCapture?.hasRenderedPages?.()) {
+        if (needsClassroomHandoff && !receivedClassroomCapture) {
             try {
+                pdf.currentExportFilename = location.hostname === 'classroom.google.com'
+                    ? await waitForStablePreviewFilename(
+                        '', pdf.viewerNavigationPending === true, pdf.lastExportedFilename || ''
+                    )
+                    : '';
+                // Cancel may have arrived while waiting for Classroom's title.
+                if (pdf.stopRequested || !pdf.classroomUiActive || pdf.classroomJobId !== jobId) return;
+                app.ui.showInPageOverlay(true);
+                app.ui.updateInPageOverlay('Preparing export', 'Waiting for the current preview…', 0);
                 const result = await chrome.runtime.sendMessage({
-                    action: 'startClassroomPreviewExport', filename: pdf.currentExportFilename || ''
+                    action: 'startClassroomPreviewExport',
+                    filename: pdf.currentExportFilename || '',
+                    navigationPending, navigationFingerprints, jobId
                 });
-                if (result?.success) {
-                    app.ui.showInPageOverlay(false);
-                    return;
-                }
+                if (jobId && pdf.classroomJobId !== jobId) return;
+                if (result?.success) return;
                 throw new Error(result?.error || 'Could not reach the document preview.');
             } catch (error) {
-                app.ui.showInPageOverlay(true);
-                const overlay = document.getElementById('psd-inpage-overlay');
-                overlay?.querySelector('#psd-inpage-title')?.replaceChildren(
-                    document.createTextNode('Preview unavailable')
-                );
-                overlay?.querySelector('#psd-inpage-detail')?.replaceChildren(
-                    document.createTextNode(error.message || 'Pages are not accessible.')
-                );
-                overlay?.querySelector('#psd-inpage-spinner')?.style.setProperty('display', 'none');
-                overlay?.querySelector('#psd-inpage-actions')?.style.setProperty('display', 'none');
-                overlay?.querySelector('#psd-inpage-close')?.style.setProperty('display', 'block');
+                if (jobId && pdf.classroomJobId !== jobId) return;
+                if (pdf.classroomUiActive === false || pdf.status === 'cancelled') return;
+                pdf.classroomExportHandoff = false;
+                pdf.classroomUiActive = false;
+                // A failed search is terminal: release the dimmer and allow
+                // Close immediately, even if no capture ever started.
+                pdf.classroomExportHandoff = false;
+                pdf.classroomUiActive = false;
+                pdf.status = 'idle';
+                app.ui.failInPageOverlay('Preview unavailable', error.message || 'Pages are not accessible.');
+                if (needsClassroomHandoff) {
+                    void chrome.runtime.sendMessage({
+                        action: 'classroomExportProgress',
+                        status: 'Capture incomplete',
+                        detail: error.message || 'Could not reach the document preview.',
+                        filename: pdf.currentExportFilename || '',
+                        percent: 0, jobId
+                    }).catch(() => {});
+                }
             }
             return;
         }
@@ -527,30 +641,163 @@
         await app.pdfCapture.prepare();
     }
 
+    async function waitForStablePreviewFilename(fallback = '', preferNew = false, previousName = '') {
+        const previous = previousName || pdf.lastExportedFilename || '';
+        const deadline = Date.now() + (preferNew ? 2200 : 500);
+        let candidate = '';
+        let stableSince = 0;
+        while (Date.now() < deadline) {
+            const current = getCurrentPreviewFilename();
+            if (current && (!preferNew || current !== previous)) {
+                if (current !== candidate) {
+                    candidate = current;
+                    stableSince = Date.now();
+                } else if (Date.now() - stableSince >= 250) {
+                    return current;
+                }
+            }
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        // If the viewer is still showing the previous title during a Next/
+        // Previous transition, never reuse that title for a different PDF.
+        if (preferNew && pdf.viewerNavigationPending) return candidate || '';
+        return candidate || getCurrentPreviewFilename() || fallback || '';
+    }
+
     function cancel() {
-        if (pdf.status !== 'capturing' && pdf.status !== 'processing') return;
+        if (pdf.status !== 'capturing' && pdf.status !== 'processing' &&
+            !pdf.classroomUiActive && !pdf.classroomExportHandoff) return;
         pdf.stopRequested = true;
         pdf.runId = (pdf.runId || 0) + 1;
+        pdf.classroomUiActive = false;
+        pdf.classroomExportHandoff = false;
+        app.pdfCapture.resetCaptureState();
         app.pdfCapture.finishCancelledCapture();
     }
 
     // The service worker can reach a PDF rendered in a nested Drive/Docs frame.
     chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-        if (request?.action === 'getClassroomPreviewTitle') {
+        if (request?.action === 'classroomPreviewNavigation') {
+            pdf.viewerNavigationPending = request.pending !== false;
+            if (pdf.viewerNavigationPending) app.ui.dismissFinishedClassroomOverlay?.();
+            pdf.pendingDocumentFingerprint = null;
+            if (pdf.viewerNavigationPending && Array.isArray(request.fingerprints)) {
+                pdf.viewerNavigationFingerprints = request.fingerprints
+                    .slice(0, 300).map(value => String(value).slice(0, 2000));
+            } else if (!pdf.viewerNavigationPending) {
+                pdf.viewerNavigationFingerprints = null;
+            }
+            sendResponse({ success: true });
+        } else if (request?.action === 'getClassroomPreviewTitle') {
             sendResponse({ filename: getCurrentPreviewFilename() });
+        } else if (request?.action === 'getStableClassroomPreviewTitle') {
+            void waitForStablePreviewFilename(
+                '', request.preferNew === true, String(request.previousFilename || '')
+            ).then(filename => sendResponse({ filename }));
+            return true;
         } else if (request?.action === 'probeClassroomPreviewPages') {
+            if (location.hostname !== 'classroom.google.com') app.classroomPreviewTab = true;
             const filename = String(request.filename || '').trim();
             if (filename) pdf.currentExportFilename = filename;
-            sendResponse({ hasPages: !!app.pdfCapture?.hasRenderedPages?.() &&
-                !document.querySelector('video') });
+            pdf.externalStaleFingerprints = Array.isArray(request.avoidFingerprints)
+                ? request.avoidFingerprints : null;
+            const fingerprints = app.pdfCapture?.probePageFingerprints?.() || [];
+            sendResponse({ hasPages: fingerprints.length > 0 && !document.querySelector('video'),
+                fingerprints, diagnostic: app.pdfCapture?.diagnosePageSurfaces?.() || null });
         } else if (request?.action === 'captureClassroomPreviewPages') {
+            if (location.hostname !== 'classroom.google.com') app.classroomPreviewTab = true;
+            pdf.currentExportFilename = String(request.filename || '').trim();
+            pdf.classroomJobId = String(request.jobId || '');
+            pdf.externalStaleFingerprints = Array.isArray(request.avoidFingerprints)
+                ? request.avoidFingerprints : null;
+            if (request.navigationPending === true && Array.isArray(request.navigationFingerprints)) {
+                pdf.viewerNavigationPending = true;
+                pdf.viewerNavigationFingerprints = request.navigationFingerprints
+                    .slice(0, 300).map(value => String(value).slice(0, 2000));
+                pdf.pendingDocumentFingerprint = null;
+            }
             if (!app.pdfCapture?.hasRenderedPages?.()) {
-                sendResponse({ success: false, error: 'No document pages are available.' });
+                sendResponse({ success: false, error: 'The viewer has not rendered its first page yet.' });
             } else {
-                // A filename belongs to this request, not to the previous PDF.
-                pdf.currentExportFilename = String(request.filename || '').trim();
-                app.ui.showInPageOverlay(true);
+                // The top Classroom frame owns the visible progress card. The
+                // renderer reports progress there, since an iframe overlay can
+                // be clipped or hidden behind Classroom's preview layers.
+                app.ui.showInPageOverlay(window.top === window);
+                pdf.classroomCaptureHandoffReceived = true;
                 void start();
+                sendResponse({ success: true });
+            }
+        } else if (request?.action === 'classroomExportProgressUpdate') {
+            if (request.jobId && pdf.dismissedClassroomJobId === request.jobId) {
+                sendResponse({ success: false, cancelled: true });
+                return;
+            }
+            const newJob = request.status === 'Preparing export' && Boolean(request.jobId) &&
+                request.jobId !== pdf.classroomJobId;
+            if (request.jobId && pdf.classroomJobId && request.jobId !== pdf.classroomJobId &&
+                !newJob) {
+                sendResponse({ success: false, stale: true });
+                return;
+            }
+            if (newJob) {
+                if (pdf.classroomUiActive || pdf.status === 'capturing' || pdf.status === 'processing') {
+                    sendResponse({ success: false, busy: true });
+                    return;
+                }
+                // The old PDF's completion card must not suppress the new
+                // job's progress. New jobs are announced by the background.
+                pdf.classroomJobId = request.jobId;
+                pdf.dismissedClassroomJobId = '';
+                pdf.currentExportFilename = '';
+                pdf.status = 'idle';
+                pdf.stopRequested = false;
+                app.ui.showInPageOverlay(false);
+            }
+            if (request.jobId) pdf.classroomJobId = request.jobId;
+            if (typeof request.filename === 'string' && request.filename.trim()) {
+                pdf.currentExportFilename = request.filename.trim();
+            }
+            if (request.status === 'File exported') {
+                pdf.classroomUiActive = false;
+                pdf.lastExportedFilename = pdf.currentExportFilename || '';
+                pdf.viewerNavigationPending = false;
+                void chrome.runtime.sendMessage({
+                    action: 'classroomPreviewNavigation', pending: false
+                }).catch(() => {});
+                app.ui.showInPageOverlay(true);
+                app.ui.completeInPageOverlay();
+            } else if (request.status === 'Export cancelled') {
+                pdf.classroomUiActive = false;
+                pdf.viewerNavigationPending = false;
+                void chrome.runtime.sendMessage({
+                    action: 'classroomPreviewNavigation', pending: false
+                }).catch(() => {});
+                app.ui.showInPageOverlay(true);
+                app.ui.cancelInPageOverlay();
+            } else if (request.status === 'Capture incomplete' || request.status === 'PDF conversion failed') {
+                pdf.classroomUiActive = false;
+                pdf.viewerNavigationPending = false;
+                void chrome.runtime.sendMessage({
+                    action: 'classroomPreviewNavigation', pending: false
+                }).catch(() => {});
+                app.ui.failInPageOverlay(request.status, request.detail);
+            } else {
+                if (pdf.classroomUiActive === false && pdf.stopRequested) {
+                    sendResponse({ success: false, cancelled: true });
+                    return;
+                }
+                pdf.classroomUiActive = true;
+                pdf.classroomExportHandoff = true;
+                app.ui.showInPageOverlay(true);
+                app.ui.showScrollDim(true);
+                app.ui.updateInPageOverlay(request.status, request.detail, request.percent);
+            }
+            sendResponse({ success: true });
+        } else if (request?.action === 'cancelClassroomExportInFrame') {
+            if (request.jobId && pdf.classroomJobId && request.jobId !== pdf.classroomJobId) {
+                sendResponse({ success: false, stale: true });
+            } else {
+                cancel();
                 sendResponse({ success: true });
             }
         }

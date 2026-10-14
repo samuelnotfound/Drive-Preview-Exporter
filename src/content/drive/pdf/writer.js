@@ -2,8 +2,21 @@
     const app = window.__PSD;
     const pdf = app.pdfState;
 
-    const report = (status, detail, percent = null) =>
+    const report = (status, detail, percent = null) => {
         app.ui.updateInPageOverlay(status, detail, percent);
+        // Classroom's visible overlay lives in the top frame, while PDF
+        // assembly runs in the preview frame. Relay assembly and terminal
+        // states so the top-frame overlay cannot remain stuck on capture.
+        if ((pdf.currentExportFilename || app.classroomPreviewTab || app.isClassroomViewer?.()) &&
+            typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
+            void chrome.runtime.sendMessage({
+                action: 'classroomExportProgress', status, detail, percent,
+                filename: pdf.currentExportFilename || '',
+                jobId: pdf.classroomJobId || '',
+                fingerprints: status === 'File exported' ? (pdf.activeDocumentFingerprints || []) : undefined
+            }).catch(() => {});
+        }
+    };
 
     function getDownloadFilename() {
         // In Classroom, the browser tab is usually named "Google Classroom".
@@ -117,6 +130,7 @@
         root.querySelector('#psd-inpage-spinner')?.style.setProperty('display', 'none');
         root.querySelector('#psd-inpage-check')?.style.setProperty('display', 'block');
         root.querySelector('#psd-inpage-actions')?.style.setProperty('display', 'none');
+        root.querySelector('#psd-inpage-close')?.style.setProperty('display', 'block');
         root.querySelector('#psd-inpage-title')?.replaceChildren(document.createTextNode('File exported'));
         root.querySelector('#psd-inpage-detail')?.replaceChildren();
     }
@@ -132,7 +146,6 @@
         const writer = createWriter(pages.length);
         const captureProgress = app.pdfCapture.captureProgressPercent;
 
-        app.ui.showScrollDim(false);
         const actions = document.querySelector('#psd-inpage-actions');
         const toggle = document.querySelector('#psd-inpage-toggle');
         if (actions) actions.style.display = 'flex';
@@ -170,6 +183,7 @@
             pdf.status = 'completed';
             app.pdfCapture.resetCaptureState();
             app.ui.updateWindowControl();
+            app.ui.showScrollDim(false);
             report('File exported', '', 100);
             // Let the progress ring finish its transition before showing the checkmark.
             await new Promise(resolve => setTimeout(resolve, 180));
@@ -179,6 +193,7 @@
 
             pdf.status = 'idle';
             app.ui.updateWindowControl();
+            app.ui.showScrollDim(false);
             report('PDF conversion failed', error.message || 'A page could not be converted.', 0);
             console.warn('[Drive Media Saver] PDF generation failed:', error);
         }

@@ -1026,6 +1026,9 @@ async function handleVideoStageMessage({ request }) {
 const ACTION_HANDLERS = Object.freeze({
     beginGoogleDocExport: requireDriveTab(beginGoogleDocExport),
     startClassroomPreviewExport: requireDriveTab(startClassroomPreviewExport),
+    classroomExportProgress: requireDriveTab(relayClassroomExportProgress),
+    classroomPreviewNavigation: requireDriveTab(setClassroomPreviewNavigation),
+    cancelClassroomPreviewExport: requireDriveTab(cancelClassroomPreviewExport),
     isClassroomPreviewTab: requireDriveTab(isClassroomPreviewTab),
     consumeGoogleDocExport: requireDriveTab(consumeGoogleDocExport),
     finishGoogleDocExport: requireDriveTab(finishGoogleDocExport),
