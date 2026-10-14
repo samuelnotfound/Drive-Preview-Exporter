@@ -37,7 +37,7 @@ Support for additional file types is currently unplanned.
 3. Choose the extension’s **Export** item.
 4. Follow the on-screen overlay (capture / quality picker / progress).
 
-For files opened through Google Classroom, use **File → Open → Open in new tab** first, then use the Google Drive **File** menu.
+For files opened through Google Classroom, the **"Export"** menu might work but it is not polished and breaks sometimes. It is recommended to use **File → Open → Open in new tab** first, then use the Google Drive **File** menu.
 
 ## Known Issues
 
