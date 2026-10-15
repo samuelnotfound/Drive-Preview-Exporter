@@ -23,6 +23,7 @@ Google Drive serves video and audio as separate streams to the video player. The
 
 Support for additional file types is currently unplanned.
 
+## Installation
 
 1. Download or unpack this extension folder.
 1. Download the latest release ZIP **or** clone/download this repository.
