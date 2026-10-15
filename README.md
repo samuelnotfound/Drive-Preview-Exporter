@@ -7,7 +7,7 @@
 
 ## Features
 
-- Automatically adds an **Export** button to the File menu when Google Drive’s normal download option is disabled
+- Automatically adds an **Export** button to the File menu when Google Drive’s or Google Docs' normal download option is disabled
 - Saves **view-only PDF** and **video** previews as local files
 - Processes PDF pages and video streams **locally in the browser**
 
@@ -32,7 +32,7 @@ Support for additional file types is currently unplanned.
 
 ## Usage
 
-1. Open a view-only PDF or video on Google Drive.
+1. Open a view-only PDF or video on Google Drive/Google Docs.
 2. Open the **File** menu.
 3. Choose the extension’s **Export** item.
 4. Follow the on-screen overlay (capture / quality picker / progress).
