@@ -15,7 +15,7 @@
 
 ### PDF
 
-The extension captures each page as it is rendered in the Google Drive viewer, then builds an exportable PDF from those page images.
+The extension captures each page as it is rendered in the Google Drive/Google Doc's viewer, then builds an exportable PDF from those page images.
 
 ### Video
 
