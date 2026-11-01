@@ -5,10 +5,12 @@
 > [!WARNING]
 > **Legal Disclaimer:** This tool is provided strictly for educational purposes and personal use. Users are entirely responsible for ensuring they have the legal right to save or export any content and must comply with Google Drive's Terms of Service. The creator of this repository assumes no liability for how this tool is used, nor any consequences resulting from its use.
 
+
 ## Features
 
 - Automatically adds an **Export** button to the File menu when Google Drive’s or Google Docs' normal download option is disabled
 - Saves **view-only PDF** and **video** previews as local files
+- Also available as a **PDF-only bookmarklet** (no extension install needed)
 - Processes PDF pages and video streams **locally in the browser**
 
 ## How does it work?
@@ -24,14 +26,48 @@ Google Drive serves video and audio as separate streams to the video player. The
 Support for additional file types is currently unplanned.
 
 ## Installation
+### Bookmarklet (PDF only)
 
-1. Download or unpack this extension folder.
-1. Download the latest release ZIP **or** clone/download this repository.
+No extension install needed. Works for **PDFs only**. Everything runs in your browser and nothing external is loaded.
+
+Open **[this link](https://samuelnotfound.github.io/Drive-Preview-Exporter/)** and follow the instructions.
+
+### Extension
+
+1. Download the latest release ZIP **or** clone/download this repository, then unpack it.
 2. Open `chrome://extensions`.
 3. Enable **Developer mode**.
 4. Click **Load unpacked** and select the extension folder.
 
-## Usage
+### Setup
+
+1. Open the [bookmarklet page](https://samuelnotfound.github.io/Drive-Preview-Exporter/).
+2. Drag the **Drive PDF Export** button onto your bookmarks bar (show the bar with `Ctrl/Cmd + Shift + B`).
+   - Can't drag? Create a new bookmark manually, then paste the contents of [`bookmarklet.txt`](bookmarklet.txt) as its **URL**.
+
+### Use
+
+1. Open a PDF in Google Drive and let the first page load.
+2. Click the **Drive PDF Export** bookmark.
+3. It scrolls to each page, captures it, and downloads the PDF. Keep the tab open and visible until it finishes.
+
+### Tips
+
+- Zoom the document to **200% or more** before clicking for sharper pages.
+- If a capture stalls or fails, refresh the tab and try again.
+- The overlay has a **Cancel** button if you need to stop.
+
+### Extension vs. bookmarklet
+
+| | Extension | Bookmarklet |
+|---|---|---|
+| PDF export | Yes | Yes |
+| Video export (MP4) | Yes | No |
+| Google Docs export | Yes | No |
+| Install required | Yes (Load unpacked) | No |
+| Adds File-menu button | Yes | No (click the bookmark) |
+
+## Usage (extension)
 
 1. Open a view-only PDF or video on Google Drive/Google Docs.
 2. Open the **File** menu.
