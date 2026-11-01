@@ -26,9 +26,9 @@ Google Drive serves video and audio as separate streams to the video player. The
 Support for additional file types is currently unplanned.
 
 ## Installation
-### Bookmarklet (PDF only)
+### Bookmarklet
 
-No extension install needed. Works for **PDFs only**. Everything runs in your browser and nothing external is loaded.
+No extension install needed. Works for **PDFs only**. This is the easier and faster when you only need to save some PDFs.
 
 Open **[this link](https://samuelnotfound.github.io/Drive-Preview-Exporter/)** and follow the instructions.
 
@@ -39,29 +39,15 @@ Open **[this link](https://samuelnotfound.github.io/Drive-Preview-Exporter/)** a
 3. Enable **Developer mode**.
 4. Click **Load unpacked** and select the extension folder.
 
-### Use
 
-1. Open a PDF in Google Drive and let the first page load.
-2. Click the **Drive PDF Export** bookmark.
-3. It scrolls to each page, captures it, and downloads the PDF. Keep the tab open and visible until it finishes.
+## Usage 
 
-### Tips
+### Bookmarklet
 
-- Zoom the document to **200% or more** before clicking for sharper pages.
-- If a capture stalls or fails, refresh the tab and try again.
-- The overlay has a **Cancel** button if you need to stop.
+1. Open a view-only PDF on Google Drive/Google Docs.
+2. Click "Drive PDF Export" in the bookmarks tab.
 
-### Extension vs. bookmarklet
-
-| | Extension | Bookmarklet |
-|---|---|---|
-| PDF export | Yes | Yes |
-| Video export (MP4) | Yes | No |
-| Google Docs export | Yes | No |
-| Install required | Yes (Load unpacked) | No |
-| Adds File-menu button | Yes | No (click the bookmark) |
-
-## Usage (extension)
+### Extension
 
 1. Open a view-only PDF or video on Google Drive/Google Docs.
 2. Open the **File** menu.
@@ -70,11 +56,12 @@ Open **[this link](https://samuelnotfound.github.io/Drive-Preview-Exporter/)** a
 
 For files opened through Google Classroom, the **"Export"** menu might work but it is not polished and breaks sometimes. It is recommended to use **File → Open → Open in new tab** first, then use the Google Drive **File** menu.
 
+
 ## Known Issues
 
 * PDF quality may appear blurry — Zoom the document to 200% or higher before capturing it for better quality.
 * PDF capture may not complete — Do not close or leave the current tab while a capture is in progress.
-* Video exports may be extremely slow or fail — Refresh the current tab and try the export again.
+* Video exports may be extremely slow or fail — Refresh the current tab and try the export again (and again).
 
 For other unexpected problems, refreshing the current tab usually resolves them.
 
