@@ -39,12 +39,6 @@ Open **[this link](https://samuelnotfound.github.io/Drive-Preview-Exporter/)** a
 3. Enable **Developer mode**.
 4. Click **Load unpacked** and select the extension folder.
 
-### Setup
-
-1. Open the [bookmarklet page](https://samuelnotfound.github.io/Drive-Preview-Exporter/).
-2. Drag the **Drive PDF Export** button onto your bookmarks bar (show the bar with `Ctrl/Cmd + Shift + B`).
-   - Can't drag? Create a new bookmark manually, then paste the contents of [`bookmarklet.txt`](bookmarklet.txt) as its **URL**.
-
 ### Use
 
 1. Open a PDF in Google Drive and let the first page load.
