@@ -26,9 +26,9 @@ Google Drive serves video and audio as separate streams to the video player. The
 Support for additional file types is currently unplanned.
 
 ## Installation
-### Bookmarklet
+### Bookmarklet (Easiest)
 
-No extension install needed. Works for **PDFs only**. This is the easier and faster when you only need to save some PDFs.
+**No extension install needed.** Works for **PDFs only**. This is the easier and faster way when you only need to save some PDFs.
 
 Open **[this link](https://samuelnotfound.github.io/Drive-Preview-Exporter/)** and follow the instructions.
 
