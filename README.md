@@ -7,8 +7,8 @@
 
 
 ## Features
-
-- Automatically adds an **Export** button to the File menu when Google Drive’s or Google Docs' normal download option is disabled
+- **FASTER** download compared to other similar extension
+- Automatically injects an **Export** button to the File menu when Google Drive’s or Google Docs' normal download option is disabled
 - Saves **view-only PDF** and **video** previews as local files
 - Also available as a **PDF-only bookmarklet** (no extension install needed)
 - Processes PDF pages and video streams **locally in the browser**
