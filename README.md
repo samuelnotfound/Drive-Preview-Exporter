@@ -51,6 +51,9 @@ and progress overlay.
 1. Open a view-only PDF on Google Drive/Google Docs.
 2. Click "Drive PDF Export" in the bookmarks tab.
 
+When updating the bookmarklet, replace your saved bookmark with the button from
+the latest installer page. Saved bookmarks do not update automatically.
+
 ### Extension
 
 1. Open a view-only PDF or video on Google Drive/Google Docs.
