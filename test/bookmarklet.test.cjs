@@ -2,7 +2,7 @@ const assert=require('node:assert/strict');const fs=require('node:fs');const pat
 const root=path.resolve(__dirname,'..');const html=fs.readFileSync(path.join(root,'index.html'),'utf8');const code=decodeURIComponent(/id="bm" href="javascript:([^"]+)"/.exec(html)[1]);
 function run({title='file.pdf - Google Drive',mime='',host='drive.google.com',pathname='/file/d/test/view',player=false}={}){
     const alerts=[];let created=0;const window={};
-    const document={title,querySelector(selector){if(selector==='#drive-active-item-info')return mime?{textContent:JSON.stringify({mimeType:mime})}:null;if(selector==='video,audio,iframe[src*="youtube" i]')return player?{getBoundingClientRect:()=>({width:600,height:400})}:null;return null;},createElement(){created++;throw new Error('capture-started');}};
+    const document={title,getElementById(){return null;},querySelector(selector){if(selector==='#drive-active-item-info')return mime?{textContent:JSON.stringify({mimeType:mime})}:null;if(selector==='video,audio,iframe[src*="youtube" i]')return player?{getBoundingClientRect:()=>({width:600,height:400})}:null;return null;},createElement(){created++;throw new Error('capture-started');}};
     try{vm.runInNewContext(code,{window,document,location:{hostname:host,pathname},alert:m=>alerts.push(m),setTimeout(){}});}catch(e){if(e.message!=='capture-started')throw e;}
     return{alerts,created,running:window.__dpeRunning};
 }
