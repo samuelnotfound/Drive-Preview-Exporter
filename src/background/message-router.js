@@ -15,6 +15,18 @@ const invalidTabResponse = () => ({ success: false, error: 'Invalid Drive tab.' 
 /** Standardized response factory when a Drive file changes mid-operation */
 const sessionChangedResponse = () => ({ success: false, error: 'The current Drive video session changed.' });
 
+async function handlePrepareVideoPlayback({ tabId }) {
+    const rows = await runQualityDom(tabId, 'prepareMutedPlayback');
+    return rows.find(row => row?.value?.ok)?.value
+        || rows.find(row => row?.value?.error)?.value
+        || { ok: false, error: 'Could not find the Drive video player.' };
+}
+
+async function handleRestoreVideoPlayback({ tabId }) {
+    await runQualityDom(tabId, 'restorePlayback');
+    return { success: true };
+}
+
 /**
  * Higher-order middleware function ensuring a valid integer `tabId` exists in context.
  *
@@ -497,6 +509,10 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
             const clickAt = Date.now();
             const selected = await selectQualityVerified(tabId, label || `${height}p`, height, 8000, null);
             if (!selected?.ok) return { success: false, error: `Could not find ${label || height + 'p'} in the quality menu.` };
+            const playback = await runQualityDom(tabId, 'prepareMutedPlayback');
+            if (!playback.some(row => row?.value?.ok)) {
+                return { success: false, error: playback.find(row => row?.value?.error)?.value?.error || 'Could not start the muted preview.' };
+            }
             try { await nudgePlaybackAfterQualitySwitch(tabId); } catch (_) {}
 
             let video = await waitForQualityStream(tabId, probe.token, height, 6000, new Set(), clickAt);
@@ -554,6 +570,7 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
         } finally {
             if (probe?.token) try { await endQualityProbe(tabId, probe.token); } catch (_) {}
             try { await closePlayerMenu(tabId); } catch (_) {}
+            try { await runQualityDom(tabId, 'restorePlayback'); } catch (_) {}
         }
     })();
     QUALITY_SCAN_TAB_LOCK.set(tabId, { promise: work, finishedAt: 0 });
@@ -931,6 +948,8 @@ const ACTION_HANDLERS = Object.freeze({
     videoPlaybackIntent: requireDriveTab(handleVideoPlaybackIntent, () => ({ success: false })),
     videoPlaybackStarted: requireDriveTab(handleVideoPlaybackStarted, () => ({ success: false })),
     listPlayerQualityLabels: requireDriveTab(handleListPlayerQualityLabels),
+    prepareVideoPlayback: requireDriveTab(handlePrepareVideoPlayback),
+    restoreVideoPlayback: requireDriveTab(handleRestoreVideoPlayback),
     captureQualityForDownload: requireDriveTab(handleCaptureQualityForDownload),
     clearTabCaptureState: requireDriveTab(handleClearTabCaptureState),
     getStreams: handleGetStreams,

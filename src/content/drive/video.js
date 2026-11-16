@@ -56,10 +56,9 @@
         const hasFormats = (video.formats?.video?.length || video.formats?.progressive?.length) > 0;
         const downloadBusy = video.operation === 'staging' || !!videoOverlay.getJobId?.();
         const ready = isPlaybackReadyForDownload();
-        // Picker/scanning stay interactive once opened; idle Download requires playback.
+        // Export can start its own muted preview; playback is no longer a prerequisite.
         const blocked = downloadBusy
-            || video.operation === 'scanning'
-            || (video.operation === 'idle' && !ready);
+            || video.operation === 'scanning';
 
         let labelText = 'Export';
         let infoText = 'Drive Preview Exporter';
@@ -70,8 +69,7 @@
         } else if (video.operation === 'scanning') {
             labelText = 'Reading qualities…';
         } else if (!ready) {
-            labelText = 'Export';
-            infoText = 'Play a video first to enable download.';
+            infoText = 'Scans qualities and starts a muted preview automatically.';
         }
 
         document.querySelectorAll('#' + VIDEO_MENU_ID).forEach(item => {
@@ -284,6 +282,7 @@
     }
 
     function applyQualityOptions(options, note) {
+        options = options.slice().sort((a, b) => Number(b.height || 0) - Number(a.height || 0));
         const formats = {
             video: options.map(o => ({
                 id: `label:${o.height}`,
@@ -311,11 +310,7 @@
 
     async function runQualityDetection() {
         if (video.operation === 'scanning') return;
-
-        if (!isPlaybackReadyForDownload()) {
-            updateVideoMenuState();
-            return;
-        }
+        let previewPrepared = false;
 
         video.operation = 'scanning';
         updateVideoMenuState();
@@ -327,6 +322,11 @@
             const context = await core.syncViewerContext(true);
             if (!context?.fileId) throw new Error('Could not identify the current Drive video.');
 
+            const playback = await core.sendRuntime({ action: 'prepareVideoPlayback' });
+            if (!playback?.ok) throw new Error(playback?.error || 'Could not start the muted Drive preview.');
+            previewPrepared = true;
+            video.playbackStarted = true;
+
             // 1) Prefer heights from the intercepted /playback API (prototype approach).
             //    Available as soon as the video has played; no Settings→Quality DOM needed.
             const fromApi = optionsFromPlaybackApi();
@@ -337,9 +337,10 @@
                 );
                 await quality.show(
                     formats,
-                    `Found ${fromApi.length} quality option(s). Select one, then Export.`,
+                    `Found ${fromApi.length} quality option(s). Starting export at the remembered or highest quality…`,
                     fromApi
                 );
+                await quality.download();
                 return;
             }
 
@@ -357,9 +358,10 @@
                 );
                 await quality.show(
                     formats,
-                    `Found ${options.length} quality option(s). Select one, then Export.`,
+                    `Found ${options.length} quality option(s). Starting export at the remembered or highest quality…`,
                     options
                 );
+                await quality.download();
                 return;
             }
 
@@ -368,7 +370,7 @@
             await quality.show(
                 { video: [], audio: [], progressive: [] },
                 response?.error
-                    || 'Could not read quality options from the player. Keep the video playing and try Download again.',
+                    || 'Could not read quality options from the player. Try Export again.',
                 []
             );
             return;
@@ -377,11 +379,15 @@
                 video.operation = 'picker';
                 await quality.show(
                     { video: [], audio: [], progressive: [] },
-                    error?.message || 'Quality detection failed. Try again while the video is playing.',
+                    error?.message || 'Quality detection failed. Try Export again.',
                     []
                 );
                 return;
             } catch (_) {}
+        } finally {
+            if (previewPrepared) {
+                try { await core.sendRuntime({ action: 'restoreVideoPlayback' }); } catch (_) {}
+            }
         }
 
         quality.resetScanUI();
@@ -390,13 +396,6 @@
     async function startVideoFromMenu() {
         if (video.operation === 'staging' || video.operation === 'scanning' || videoOverlay.getJobId?.()) return;
         if (video.operation !== 'idle') return;
-
-        // Hard gate: Download only runs after real playback / stream activity.
-        if (!isPlaybackReadyForDownload()) {
-            updateVideoMenuState();
-            return;
-        }
-        video.playbackStarted = true;
 
         // Only skip the label scan if we already listed player quality rows this session.
         // Having a current stream URL alone is NOT enough — that is the bug that
@@ -420,9 +419,10 @@
             };
             await quality.show(
                 formats,
-                video.scanCache?.note || `Found ${menuOpts.length} quality option(s). Select one, then Export.`,
+                video.scanCache?.note || `Found ${menuOpts.length} quality option(s). Starting export…`,
                 menuOpts
             );
+            await quality.download();
             return;
         }
 
@@ -512,13 +512,6 @@
 
         const activate = (item, event) => {
             if (!item || event.target?.closest?.('#psd-video-quality-picker') || video.operation !== 'idle') return;
-            if (!isPlaybackReadyForDownload()) {
-                event.preventDefault();
-                event.stopImmediatePropagation();
-                event.stopPropagation();
-                updateVideoMenuState();
-                return;
-            }
             event.preventDefault();
             event.stopImmediatePropagation();
             event.stopPropagation();
@@ -593,6 +586,8 @@
         video.operation = 'idle';
         video.fileId = '';
         video.viewerSessionId = '';
+        video.lastSelectedHeight = 0;
+        video.lastSelectedQuality = '';
         video.formats = core.cloneFormats({});
         void quality.clearSnapshot(previousFileId);
     }

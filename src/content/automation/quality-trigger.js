@@ -4,6 +4,7 @@
 
   const { sleep, allRoots, isVisible, mediaElements, areaOf } = window.__PSD_CONTENT_UTILS;
   const norm = value => String(value == null ? '' : value).replace(/\s+/g, ' ').trim().toLowerCase();
+  const playbackSnapshots = new WeakMap();
 
   const OWN_UI = '#psd-video-quality-picker,#psd-video-scan-blocker,#psd-video-page-blocker,#psd-inpage-overlay';
 
@@ -399,6 +400,49 @@
         } catch (_) {}
       }
       return { ok: true, nudged };
+    },
+
+    // Start a muted, short-lived player session so an export can capture media
+    // even when the user has not pressed Play. Preserve existing playback state
+    // and restore it after the stream URLs have been captured.
+    prepareMutedPlayback: async () => {
+      const video = biggestVideo() || mediaElements('video').find(v => !v.ended);
+      if (!video) return { ok: false, error: 'Could not find the Drive video player.' };
+      if (!playbackSnapshots.has(video)) {
+        playbackSnapshots.set(video, {
+          paused: video.paused,
+          muted: video.muted,
+          volume: video.volume
+        });
+      }
+      video.muted = true;
+      video.volume = 0;
+      try {
+        if (video.paused) await video.play();
+      } catch (_) {
+        const previous = playbackSnapshots.get(video);
+        playbackSnapshots.delete(video);
+        video.muted = previous.muted;
+        video.volume = previous.volume;
+        return { ok: false, error: 'Chrome could not start the muted preview. Click Play once, then retry Export.' };
+      }
+      return { ok: !video.paused, wasPaused: playbackSnapshots.get(video).paused };
+    },
+
+    restorePlayback: () => {
+      let restored = false;
+      for (const video of mediaElements('video')) {
+        const previous = playbackSnapshots.get(video);
+        if (!previous) continue;
+        playbackSnapshots.delete(video);
+        try {
+          if (previous.paused && !video.paused) video.pause();
+          video.muted = previous.muted;
+          video.volume = previous.volume;
+          restored = true;
+        } catch (_) {}
+      }
+      return { ok: restored };
     },
 
     closeMenu: () => {

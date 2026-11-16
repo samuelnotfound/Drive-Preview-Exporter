@@ -113,12 +113,12 @@ async function runQualityDom(tabId, action, params = {}, options = {}) {
     const finalArgs = (action === 'clickLabel' || action === 'clickQuality' || action === 'nudgePlayback')
         ? [params]
         : (action === 'enableMuteGuard' || action === 'releaseMuteGuard' || action === 'closeMenu' || action === 'revealControls'
-            || action === 'scanQualities' || action === 'resumePlayback')
+            || action === 'scanQualities' || action === 'resumePlayback' || action === 'prepareMutedPlayback' || action === 'restorePlayback')
             ? []
             : [params];
 
     // Whether this action simulates user clicking on the player UI
-    const isClickAction = action === 'clickLabel' || action === 'clickQuality';
+    const isClickAction = action === 'clickLabel' || action === 'clickQuality' || action === 'prepareMutedPlayback';
     const rows = [];
 
     // Iterate through all candidate frames

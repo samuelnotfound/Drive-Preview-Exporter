@@ -187,6 +187,12 @@
         video.formats = cloneFormats({});
         video.pickerFormats = null;
         video.scanCache = null;
+        video.qualityMenuOptions = [];
+        video.playbackQualityHeights = [];
+        video.playbackQualityLabels = [];
+        video.playbackQualityFileId = '';
+        video.lastSelectedHeight = 0;
+        video.lastSelectedQuality = '';
     }
 
     function applyContextResponse(response, expectedFileId = '', expectedViewerSessionId = '') {
