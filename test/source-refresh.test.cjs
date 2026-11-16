@@ -3,7 +3,7 @@ const source=fs.readFileSync(path.join(__dirname,'../src/background/video-jobs.j
 function harness(capture){
     const job={jobId:'job',mode:'adaptive',sourceTabId:1,fileId:'test-file',viewerSessionId:'test-viewer',videoUrl:'https://example.com/video',audioUrl:'https://example.com/audio',filename:'test.mp4'};
     const jobs={job};const session={fileId:job.fileId,viewerSessionId:job.viewerSessionId};let calls=0;
-    const context=vm.createContext({getStoredJobs:async()=>jobs,getStoredSession:async()=>session,queueJobMutation:async fn=>fn(jobs),parseStreamCandidate:()=>({height:720}),cleanURL:url=>url,getStreamBytes:()=>100,handleCaptureQualityForDownload:async args=>{calls++;assert.equal(args.request.forceFresh,true);return capture?capture():{success:true,video:{url:'https://example.com/fresh-video',contentLength:100},audio:{url:'https://example.com/fresh-audio',contentLength:100}};}});
+    const context=vm.createContext({getStoredJobs:async()=>jobs,getStoredSession:async()=>session,queueJobMutation:async fn=>fn(jobs),isMuxedStream:stream=>stream.itag==='18',parseStreamCandidate:()=>({height:720}),cleanURL:url=>url,getStreamBytes:()=>100,handleCaptureQualityForDownload:async args=>{calls++;assert.equal(args.request.forceFresh,true);return capture?capture():{success:true,video:{url:'https://example.com/fresh-video',contentLength:100},audio:{url:'https://example.com/fresh-audio',contentLength:100}};}});
     vm.runInContext(source,context);
     return {jobs,session,get calls(){return calls;},refresh:()=>context.refreshVideoStageStreams({request:{jobId:'job'}})};
 }
