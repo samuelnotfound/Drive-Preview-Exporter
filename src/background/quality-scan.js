@@ -63,11 +63,7 @@ async function waitForQualityStream(tabId, probeToken, height, waitMs, usedUrls 
             // Skip streams that were already downloaded or consumed
             if (key && usedUrls.has(key)) continue;
 
-            // Height matching with 8-pixel macroblock tolerance
-            if (h && Number(stream.qualityHeight || stream.height || 0) > 0) {
-                const sh = Number(stream.qualityHeight || stream.height || 0);
-                if (sh !== h && Math.abs(sh - h) > 8) continue;
-            }
+            if (!matchesQualityStream(stream, h, probeToken)) continue;
 
             // Stream matched all criteria!
             return stream;

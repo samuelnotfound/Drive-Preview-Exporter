@@ -103,6 +103,13 @@
         throw Object.assign(new Error('Drive returned too many media redirects. Try Download again.'), { name: 'MediaTransportError' });
     }
 
+    function httpError(response, label) {
+        try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+        return Object.assign(new Error(`${label} download failed (${response.status})`), {
+            name: [401, 403, 410].includes(response.status) ? 'StreamSourceError' : 'Error'
+        });
+    }
+
     function rangeUnsupported(message) {
         return Object.assign(new Error(message), { name: 'RangeUnsupportedError' });
     }
@@ -255,7 +262,7 @@
                 requireRawMedia(response);
 
                 if (!response.ok && response.status !== 206) {
-                    lastError = new Error(`${label} download failed (${response.status})`);
+                    lastError = httpError(response, label);
                     try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
                     continue;
                 }
@@ -324,7 +331,7 @@
             try {
                 return await fetchRange(baseUrl, start, end, ctx, label);
             } catch (err) {
-                if (err?.name === 'AbortError' || err?.name === 'RangeUnsupportedError'
+                if (err?.name === 'AbortError' || err?.name === 'RangeUnsupportedError' || err?.name === 'StreamSourceError'
                     || cancelledJobs.has(ctx.jobId)) throw err;
                 lastError = err;
                 if (i + 1 < CHUNK_RETRIES) {
@@ -344,7 +351,7 @@
             credentials: 'include', cache: 'no-store', signal: ctx.signal
         }, ctx);
         requireRawMedia(response);
-        if (!response.ok) throw new Error(`${label} download failed (${response.status})`);
+        if (!response.ok) throw httpError(response, label);
         const declared = Number(response.headers.get('content-length')) || 0;
         const reader = response.body?.getReader?.();
         if (!reader) throw new Error('This browser cannot stream the response to disk.');
@@ -691,7 +698,7 @@
                         });
                         continue;
                     }
-                    if (sourceRefreshes < 1 && ['MediaTransportError', 'IncompleteStreamError', 'MediaValidationError'].includes(err?.name)) {
+                    if (sourceRefreshes < 1 && (['MediaTransportError', 'IncompleteStreamError', 'MediaValidationError', 'StreamSourceError'].includes(err?.name) || (attempt.stuck && autoRestarts >= 1))) {
                         sourceRefreshes++;
                         postStageMessage('videoStageStatus', {
                             jobId, stage: 'download', message: 'Capturing fresh stream URLs…'
@@ -700,12 +707,14 @@
                             const fresh = await chrome.runtime.sendMessage({ type: 'refreshVideoStageStreams', jobId });
                             throwIfCancelled(jobId);
                             if (parentSignal.aborted) throw abortError();
-                            const nextUrl = fresh?.[label === 'audio' ? 'audioUrl' : 'videoUrl'];
+                            const urlKey = job.mode === 'single' ? 'mediaUrl' : (label === 'audio' ? 'audioUrl' : 'videoUrl');
+                            const bytesKey = job.mode === 'single' ? 'mediaBytes' : (label === 'audio' ? 'audioBytes' : 'videoBytes');
+                            const nextUrl = fresh?.[urlKey];
                             if (!fresh?.success || !nextUrl) throw err;
                             await st.disk.abort();
                             st.disk = await window.GDriveVideoDiskStorage.createStream(jobId, label);
                             st.bytes = 0;
-                            st.total = Math.max(0, Number(fresh[label === 'audio' ? 'audioBytes' : 'videoBytes']) || st.total);
+                            st.total = Math.max(0, Number(fresh[bytesKey]) || st.total);
                             st.parallelChunks = null;
                             st.probed = false;
                             st.rangeMode = null;
@@ -714,7 +723,7 @@
                             continue;
                         } catch (refreshError) {
                             if (cancelledJobs.has(jobId) || parentSignal.aborted) throw abortError();
-                            throw err;
+                            if (!attempt.stuck) throw err;
                         }
                     }
                     if (attempt.stuck) {

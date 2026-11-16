@@ -1,6 +1,6 @@
 {
   "name": "drive-preview-exporter",
-  "version": "1.9.60",
+  "version": "1.9.61",
   "private": true,
   "description": "Developer checks for the unpacked Chrome extension.",
   "scripts": {

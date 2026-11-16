@@ -69,6 +69,7 @@ async function createVideoStageJob(tabId, session, mode, payload) {
             viewerSessionId: session?.viewerSessionId || '',
             filename: payload.filename,
             mode,
+            qualityHeight: Number(payload.qualityHeight || 0),
             videoUrl: payload.videoUrl || null,
             audioUrl: payload.audioUrl || null,
             mediaUrl: payload.mediaUrl || null,
@@ -129,6 +130,7 @@ function createStagePayload(selected, filename) {
     if (selected.mode === 'single') {
         return {
             filename,
+            qualityHeight: Number(selected.media.qualityHeight || selected.media.height || 0),
             mediaUrl: cleanURL(selected.media.originalUrl || selected.media.url),
             mediaBytes: sizes.mediaBytes,
             mediaMime: selected.media.mime || 'video/mp4'
@@ -136,6 +138,7 @@ function createStagePayload(selected, filename) {
     }
     return {
         filename,
+        qualityHeight: Number(selected.video.qualityHeight || selected.video.height || 0),
         videoUrl: cleanURL(selected.video.originalUrl || selected.video.url),
         audioUrl: cleanURL(selected.audio.originalUrl || selected.audio.url),
         videoBytes: sizes.videoBytes,
@@ -193,19 +196,18 @@ function pickBestAudioFromPools(session, tabId) {
 /** Resolve video (or progressive) stream from session pools matching the request. */
 function pickVideoFromPools(session, request, tabId) {
     const formats = session?.formats || { video: [], audio: [], progressive: [] };
-    const find = (list, id) => Array.isArray(list) ? list.find(item => item?.id === id && item?.url) : null;
+    const find = (list, id) => Array.isArray(list) ? list.find(item => item?.id === id && item?.url && (!wantHeight || matchesQualityStream(item, wantHeight))) : null;
     const wantHeight = Number(request?.qualityHeight || 0);
-    const heightOf = item => Number(item?.qualityHeight || item?.height || 0);
 
     const selectedProgressive = find(formats.progressive, request.progressiveFormatId)
-        || (wantHeight ? (formats.progressive || []).find(item => heightOf(item) === wantHeight && item?.url) : null);
+        || (wantHeight ? (formats.progressive || []).find(item => matchesQualityStream(item, wantHeight)) : null);
     if (selectedProgressive) return { mode: 'single', media: selectedProgressive };
 
     let video = wantHeight
-        ? (formats.video || []).find(item => heightOf(item) === wantHeight && item?.url)
+        ? (formats.video || []).find(item => matchesQualityStream(item, wantHeight))
         : null;
     if (!video) video = find(formats.video, request.videoFormatId);
-    if (!video && formats.video?.length) {
+    if (!wantHeight && !video && formats.video?.length) {
         video = formats.video.find(item => item?.url) || formats.video[0];
     }
 
@@ -217,13 +219,12 @@ function pickVideoFromPools(session, request, tabId) {
                 : [])
         ];
         if (wantHeight) {
-            video = candidates.find(item => heightOf(item) === wantHeight && item?.url)
-                || candidates.find(item => Number(item?.height || 0) === wantHeight && item?.url);
+            video = candidates.find(item => matchesQualityStream(item, wantHeight));
         }
-        if (!video?.url) video = candidates.find(item => item?.url) || null;
+        if (!wantHeight && !video?.url) video = candidates.find(item => item?.url) || null;
     }
 
-    if (!video?.url && session?.video) {
+    if (!wantHeight && !video?.url && session?.video) {
         video = {
             url: session.video,
             originalUrl: session.videoOriginal || session.video,
@@ -271,7 +272,13 @@ async function startVideoDownload(tabId, request = {}) {
     // Prefer URLs supplied by the quality picker; fall back to session pools.
     let selected = null;
     if (request.videoUrl) {
+        const parsedVideo = parseStreamCandidate(request.videoUrl);
+        if (request.qualityHeight && parsedVideo?.height && Math.abs(Number(request.qualityHeight) - parsedVideo.height) > 8) {
+            return { success: false, error: 'The captured stream does not match the selected resolution. Choose the quality again.' };
+        }
+        if (isAudioStream(parsedVideo)) return { success: false, error: 'An audio-only URL cannot be used for the selected video.' };
         const video = {
+            ...parsedVideo,
             url: cleanURL(request.videoUrl) || request.videoUrl,
             originalUrl: request.videoUrl,
             height: Number(request.qualityHeight || 0),
@@ -279,7 +286,9 @@ async function startVideoDownload(tabId, request = {}) {
             probeQuality: request.qualityLabel || ''
         };
 
-        if (request.audioUrl) {
+        if (isMuxedStream(video)) {
+            selected = { mode: 'single', media: { ...video, progressive: true } };
+        } else if (request.audioUrl) {
             selected = {
                 mode: 'adaptive',
                 video,
@@ -289,8 +298,6 @@ async function startVideoDownload(tabId, request = {}) {
                     mime: 'audio/mp4'
                 }
             };
-        } else if (isMuxedStream(video)) {
-            selected = { mode: 'single', media: { ...video, progressive: true } };
         } else {
             const audio = pickBestAudioFromPools(session, tabId);
             if (audio?.url) {
@@ -359,21 +366,28 @@ function refreshVideoStageStreams({ request }) {
     if (sourceRefreshes.has(jobId)) return sourceRefreshes.get(jobId);
     const work = (async () => {
         const job = (await getStoredJobs())[jobId];
-        if (!job || job.mode !== 'adaptive') return { success: false, error: 'No active adaptive download.' };
+        if (!job || !['single', 'adaptive'].includes(job.mode)) return { success: false, error: 'No active video download.' };
         const session = await getStoredSession(job.sourceTabId);
         if (!session || validateDownloadContext(session, job)) return { success: false, error: 'The Drive viewer changed.' };
-        const height = Number(parseStreamCandidate(job.videoUrl)?.height || 0);
+        const height = Number(job.qualityHeight || parseStreamCandidate(job.videoUrl || job.mediaUrl)?.height || 0);
         if (!height) return { success: false, error: 'Could not identify the selected quality.' };
         const capture = await handleCaptureQualityForDownload({
             tabId: job.sourceTabId,
             request: { fileId: job.fileId, qualityHeight: height, qualityLabel: height + 'p', forceFresh: true }
         });
-        if (!capture?.success || !capture.video?.url || !capture.audio?.url) {
+        if (!capture?.success || !capture.video?.url || (job.mode === 'adaptive' && !capture.audio?.url)) {
             return { success: false, error: 'Fresh video and audio streams were not captured. Play the video and try Download again.' };
         }
         const current = await getStoredSession(job.sourceTabId);
         if (!current || validateDownloadContext(current, job)) return { success: false, error: 'The Drive viewer changed.' };
-        const payload = createStagePayload({ mode: 'adaptive', video: capture.video, audio: capture.audio }, job.filename);
+        const capturedVideo = { ...parseStreamCandidate(capture.video.originalUrl || capture.video.url), ...capture.video };
+        if ((job.mode === 'single') !== isMuxedStream(capturedVideo)) {
+            return { success: false, error: 'The stream format changed. Choose the quality again.' };
+        }
+        const selected = job.mode === 'single'
+            ? { mode: 'single', media: capturedVideo }
+            : { mode: 'adaptive', video: capturedVideo, audio: capture.audio };
+        const payload = createStagePayload(selected, job.filename);
         let updated = false;
         await queueJobMutation(jobs => {
             if (!jobs[jobId]) return false;

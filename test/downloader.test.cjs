@@ -11,7 +11,7 @@ const source = fs.readFileSync(path.join(__dirname, '../src/offscreen/video-stag
 const abortError = () => Object.assign(new Error('Aborted'), {name:'AbortError'});
 function deferred() { let resolve; const promise=new Promise(done => { resolve=done; }); return {promise,resolve}; }
 
-function harness({job={}, fetch, createStream, refresh}={}) {
+function harness({job={}, fetch, createStream, refresh, clock}={}) {
     job={jobId:'test-job', mode:'single', mediaUrl:'https://example.com/video', videoUrl:'https://example.com/video', audioUrl:'https://example.com/audio', ...job};
     let listener;
     const done=deferred();
@@ -52,7 +52,7 @@ function harness({job={}, fetch, createStream, refresh}={}) {
             return Promise.resolve();
         }
     }};
-    vm.runInNewContext(shared + '\n' + media + '\n' + source,{window,chrome,fetch,URL,Blob,Uint8Array,TextDecoder,AbortController,performance,setTimeout,clearTimeout,setInterval,clearInterval});
+    vm.runInNewContext(shared + '\n' + media + '\n' + source,{window,chrome,fetch,URL,Blob,Uint8Array,TextDecoder,AbortController,performance,setTimeout,clearTimeout,setInterval,clearInterval,...clock});
     function send(type) { listener({target:'video-offscreen',type,jobId:job.jobId},null,()=>{}); }
     return {start() { send('videoStageStart'); return done.promise; },cancel() { send('videoStageCancelInternal'); },restart() { send('videoStageRestartInternal'); },messages,disks,get removed() {return removed;}};
 }
@@ -267,4 +267,37 @@ test('a failed source is recaptured once and can finish without a page refresh',
 test('persistent non-media responses stop after one recapture per stream', {timeout:3000}, async()=>{
     let refreshes=0;const h=harness({refresh:()=>{refreshes++;return {success:true,videoUrl:'https://example.com/still-invalid'};},fetch:async()=>new Response('<html>still invalid</html>',{headers:{'content-type':'text/html'}})});
     assert.equal((await h.start()).type,'videoStageError');assert.equal(refreshes,1);assert.equal(h.messages.some(m=>m.type==='videoStageSourcesReady'),false);
+});
+
+
+test('an expired source is recaptured once instead of repeatedly failing with HTTP 403', {timeout: 6000}, async () => {
+    const bytes = mp4();
+    let refreshes = 0;
+    const h = harness({
+        refresh: () => { refreshes++; return {success: true, mediaUrl: 'https://example.com/fresh-video', mediaBytes: bytes.length}; },
+        fetch: async url => url.includes('fresh-video')
+            ? new Response(bytes, {headers: {'content-length': String(bytes.length)}})
+            : new Response(null, {status: 403})
+    });
+    assert.equal((await h.start()).type, 'saved');
+    assert.equal(refreshes, 1);
+    assert.deepEqual(Buffer.from(await h.disks.get('video').bytes), bytes);
+});
+
+test('a repeatedly stalled source is recaptured instead of retrying only the old URL', {timeout: 3000}, async () => {
+    const bytes = mp4();
+    let now = 0, refreshes = 0, oldAttempts = 0;
+    const h = harness({
+        clock: {Date: {now: () => now}, setInterval(fn) { return setInterval(() => { now += 21000; fn(); }, 2); }},
+        refresh: () => { refreshes++; return {success: true, mediaUrl: 'https://example.com/fresh-video', mediaBytes: bytes.length}; },
+        fetch: async (url, options) => {
+            if (url.includes('fresh-video')) return new Response(bytes, {headers: {'content-length': String(bytes.length)}});
+            oldAttempts++;
+            await new Promise(resolve => options.signal.addEventListener('abort', resolve, {once: true}));
+            throw abortError();
+        }
+    });
+    assert.equal((await h.start()).type, 'saved');
+    assert.equal(oldAttempts, 2);
+    assert.equal(refreshes, 1);
 });

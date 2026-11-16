@@ -378,3 +378,14 @@ function mergeFormatLists(first, second, sortFn, max = 24) {
     // Sort and truncate
     return [...map.values()].sort(sortFn).slice(0, max);
 }
+
+/** Match actual URL metadata first; probe-only heights belong to one capture. */
+function matchesQualityStream(stream, height, probeToken = '') {
+    if (!stream?.url || isAudioStream(stream)) return false;
+    const parsed = parseStreamCandidate(stream.originalUrl || stream.url);
+    const actual = Number(parsed?.height || 0);
+    const candidateHeight = actual || Number(stream.height || stream.qualityHeight || 0);
+    if (!candidateHeight || !height || Math.abs(candidateHeight - height) > 8) return false;
+    if (!actual && stream.heightSource === 'probe') return !!probeToken && stream.probeToken === probeToken;
+    return true;
+}

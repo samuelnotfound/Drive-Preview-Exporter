@@ -470,156 +470,74 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
     const forceFresh = request.forceFresh === true;
     const height = Number(request.qualityHeight || request.height || 0);
     const label = String(request.qualityLabel || request.label || (height ? `${height}p` : '')).trim();
-    if (!height && !label) {
-        return { success: false, error: 'No quality selected.' };
-    }
-
+    if (!height) return { success: false, error: 'No quality selected.' };
     const found = await getSessionForFile(tabId, request.fileId);
     if (!found) return sessionChangedResponse();
     const { fileId } = found;
-
-    // Concurrency lock
-    const existing = QUALITY_SCAN_TAB_LOCK.get(tabId);
-    if (existing?.promise) {
+    const viewerSessionId = found.session.viewerSessionId || '';
+    const isCurrentSession = session => session && session.fileId === fileId &&
+        String(session.viewerSessionId || '') === viewerSessionId;
+    if (QUALITY_SCAN_TAB_LOCK.get(tabId)?.promise) {
         return { success: false, error: 'Another quality capture is already running.' };
     }
 
     const work = (async () => {
+        let probe;
         try {
-            const clickAt = Date.now();
-
             await closePlayerMenu(tabId);
             await sleep(120);
             try { await runQualityDom(tabId, 'revealControls'); } catch (_) {}
             await sleep(100);
+            if (!isCurrentSession(await getStoredSession(tabId))) return sessionChangedResponse();
 
-            // Select quality verified in player menu
-            const selected = await selectQualityVerified(
-                tabId, label || `${height}p`, height, 8000, null
-            );
-            if (!selected?.ok) {
-                return { success: false, error: `Could not find ${label || height + 'p'} in the quality menu.` };
-            }
-
-            // Snapshot stream currently playing (in case user re-selected current quality)
-            const harvestCurrentVideo = () => {
-                const recent = (streamCaptureState(tabId)?.recentStreams || [])
-                    .filter(s => s?.url && !isAudioStream(s))
-                    .sort((a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0));
-                if (recent[0]?.url) return recent[0];
-                return null;
-            };
-            const alreadyPlaying = harvestCurrentVideo();
-
-            // Nudge playback to trigger HTTP segment request
+            // Install the probe before clicking: the player can request the new
+            // resolution immediately, while the click animation is still running.
+            probe = await beginQualityProbe(tabId, fileId, label || `${height}p`);
+            if (!probe || probe.accepted === false) return sessionChangedResponse();
+            const clickAt = Date.now();
+            const selected = await selectQualityVerified(tabId, label || `${height}p`, height, 8000, null);
+            if (!selected?.ok) return { success: false, error: `Could not find ${label || height + 'p'} in the quality menu.` };
             try { await nudgePlaybackAfterQualitySwitch(tabId); } catch (_) {}
 
-            // Start quality probe transaction
-            const probe = await beginQualityProbe(tabId, fileId, label || `${height}p`);
-            if (probe && probe.accepted === false) {
-                return { success: false, error: 'Session changed during quality capture. Open the video again and retry.' };
-            }
-
-            let video = null;
-            try {
-                // Wait for network capture matching probe
-                video = await waitForQualityStream(tabId, probe.token, height, (forceFresh ? 6000 : (typeof FAST_SCAN !== "undefined" ? FAST_SCAN.streamWaitMs : 1500)), new Set(), clickAt);
-                if (!video?.url) {
-                    const recentAfter = (streamCaptureState(tabId)?.recentStreams || [])
-                        .filter(s => s?.url && !isAudioStream(s) && Number(s.capturedAt || 0) >= clickAt - 50)
-                        .sort((a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0));
-                    video = recentAfter[0] || null;
-                }
-                // Fallback to already playing stream if Drive didn't fire a new request
-                if (!forceFresh && !video?.url && alreadyPlaying?.url) {
-                    video = alreadyPlaying;
-                }
-                // Recovery must not silently reuse the stale source that just failed.
-                if (!forceFresh && !video?.url) {
-                    const session = await getStoredSession(tabId);
-                    if (session?.video) {
-                        const h = Number(
-                            session.formats?.video?.[0]?.qualityHeight
-                            || session.formats?.video?.[0]?.height
-                            || session.videoCandidates?.[0]?.height
-                            || 0
-                        );
-                        video = {
-                            url: session.video,
-                            originalUrl: session.videoOriginal || session.video,
-                            height: h,
-                            qualityHeight: h
-                        };
-                    } else {
-                        video = harvestCurrentVideo();
-                    }
-                }
-            } finally {
-                try { await endQualityProbe(tabId, probe.token); } catch (_) {}
-            }
-
+            let video = await waitForQualityStream(tabId, probe.token, height, 6000, new Set(), clickAt);
             if (!video?.url) {
-                return {
-                    success: false,
-                    error: `${label || height + 'p'} is selected but no video stream URL is available. Seek the video a bit, then try Export again.`
-                };
+                try { await nudgePlaybackAfterQualitySwitch(tabId); } catch (_) {}
+                video = await waitForQualityStream(tabId, probe.token, height, 4000, new Set(), clickAt);
             }
-
-            // Stamp verified height
-            const actualH = Number(video.height || video.qualityHeight || 0);
-            const probeMatched = (
-                video.probeToken
-                || Number(video.probeHeight || 0) === height
-                || video.heightSource === 'probe'
-                || (actualH && actualH === height)
-            );
-            const stampedHeight = probeMatched
-                ? (actualH || height)
-                : (actualH || 0);
-
+            // Re-selecting an already buffered quality may not make a new request.
+            // Only independently identified, matching cached streams are eligible.
+            if (!forceFresh && !video?.url) {
+                video = (streamCaptureState(tabId)?.recentStreams || [])
+                    .filter(stream => matchesQualityStream(stream, height))
+                    .sort((a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0))[0] || null;
+            }
+            if (!video?.url) return {
+                success: false,
+                error: `${label || height + 'p'} did not produce a matching video stream. Play or seek the video, then try Download again.`
+            };
+            if (!isCurrentSession(await getStoredSession(tabId))) return sessionChangedResponse();
             video = {
-                ...video,
-                height: stampedHeight,
-                qualityHeight: stampedHeight,
-                probeQuality: label || video.probeQuality || '',
+                ...video, height, qualityHeight: height, probeQuality: label,
                 url: cleanURL(video.originalUrl || video.url) || video.url,
                 originalUrl: video.originalUrl || video.url
             };
-            if (!stampedHeight && height) {
-                video.requestedHeight = height;
-                video.requestedLabel = label;
-            }
 
-            // Prefer the freshest audio seen around this capture (stale session
-            // audio URLs often return a ~1 KB error body on range download).
+            // Changing video resolution often reuses buffered audio. Keep audio
+            // scoped to this viewer; a global fallback may belong to another tab.
             const recentAudio = (streamCaptureState(tabId)?.recentStreams || [])
-                .filter(s => s?.url && isAudioStream(s))
+                .filter(stream => stream?.url && isAudioStream(stream))
                 .sort((a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0));
-            const audioAfterClick = recentAudio.find(s => Number(s.capturedAt || 0) >= clickAt - 50) || null;
-            let audio = forceFresh ? audioAfterClick : (audioAfterClick
-                || recentAudio[0]
-                || await getCurrentSessionAudioCandidate(tabId)
-                || (typeof getGlobalLastAudio === 'function' ? getGlobalLastAudio() : null));
-            if (audio?.url) {
-                audio = {
-                    ...audio,
-                    url: cleanURL(audio.originalUrl || audio.url) || audio.url,
-                    originalUrl: audio.originalUrl || audio.url
-                };
-                try { await lockSharedAudioOnSession(tabId, audio); } catch (_) {}
-            }
+            let audio = recentAudio[0] || await getCurrentSessionAudioCandidate(tabId);
+            if (audio?.url) audio = {
+                ...audio, url: cleanURL(audio.originalUrl || audio.url) || audio.url,
+                originalUrl: audio.originalUrl || audio.url
+            };
 
-            // Persist video and audio formats into stored session
+            let saved = false;
             await queueSessionMutation(tabId, current => {
-                if (!current) return false;
-                if (fileId && current.fileId && current.fileId !== fileId) return false;
+                if (!isCurrentSession(current)) return false;
                 current.formats = current.formats || { video: [], audio: [], progressive: [] };
-                current.formats.video = mergeFormatLists(
-                    current.formats.video || [],
-                    [video],
-                    byHeightWidthThenSize,
-                    48
-                );
+                current.formats.video = mergeFormatLists(current.formats.video || [], [video], byHeightWidthThenSize, 48);
                 if (audio?.url) {
                     current.formats.audio = [audio];
                     current.audio = audio.url;
@@ -629,26 +547,21 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
                 current.videoOriginal = video.originalUrl;
                 current.videoCandidates = addUniqueCandidate(current.videoCandidates || [], video, 24);
                 current.streamCaptureEnabled = true;
+                saved = true;
                 return current;
             });
-
-            return {
-                success: true,
-                video,
-                audio: audio?.url ? audio : null,
-                height,
-                label
-            };
+            return saved ? { success: true, video, audio: audio?.url ? audio : null, height, label } : sessionChangedResponse();
         } finally {
+            if (probe?.token) try { await endQualityProbe(tabId, probe.token); } catch (_) {}
             try { await closePlayerMenu(tabId); } catch (_) {}
         }
     })();
-
     QUALITY_SCAN_TAB_LOCK.set(tabId, { promise: work, finishedAt: 0 });
-    try {
-        return await work;
-    } finally {
-        QUALITY_SCAN_TAB_LOCK.set(tabId, { promise: null, finishedAt: Date.now() });
+    try { return await work; }
+    finally {
+        if (QUALITY_SCAN_TAB_LOCK.get(tabId)?.promise === work) {
+            QUALITY_SCAN_TAB_LOCK.set(tabId, { promise: null, finishedAt: Date.now() });
+        }
     }
 }
 
