@@ -62,34 +62,45 @@
         });
     }
 
-    /** Remove existing range param so we control ranges ourselves. */
-    function cleanStageURL(url) {
-        if (!url) return url;
-        try {
-            const parsed = new URL(url);
-            parsed.searchParams.delete('range');
-            return parsed.toString();
-        } catch (_) {
-            return url;
-        }
-    }
-
-    function makeRangeQueryURL(url, start, end) {
-        try {
-            const parsed = new URL(url);
-            parsed.searchParams.delete('range');
-            parsed.searchParams.set('range', `${start}-${end}`);
-            return parsed.toString();
-        } catch (_) {
-            return url;
-        }
-    }
+    const { forDownload: cleanStageURL, withRange: makeRangeQueryURL } = GDriveStreamURL;
 
     /** "bytes 0-4194303/24589214" → { start, end, total } (total 0 when "*"). */
     function parseContentRange(value) {
         const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(String(value || ''));
         if (!m) return null;
         return { start: Number(m[1]), end: Number(m[2]), total: m[3] === '*' ? 0 : Number(m[3]) };
+    }
+
+    function requireRawMedia(response) {
+        const type = response.headers.get('content-type') || '';
+        if (!/^(?:application\/vnd\.yt-ump|text\/|application\/(?:json|xml))/i.test(type)) return;
+        try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+        const message = /yt-ump/i.test(type) ? 'Drive returned player transport data' : 'Drive returned a non-media response';
+        throw Object.assign(new Error(`${message} instead of a media file. Refresh Drive and retry.`), {
+            name: 'MediaTransportError'
+        });
+    }
+
+    // Some media endpoints return an HTTPS media redirect as a small text body.
+    // Follow only Google's media hosts, with a strict size and redirect bound.
+    async function fetchMedia(url, options, ctx) {
+        for (let redirects = 0; redirects < 3; redirects++) {
+            const response = await fetch(url, options);
+            ctx.markProgress();
+            if (!response.ok || !/^text\/plain(?:;|$)/i.test(response.headers.get('content-type') || '')) return response;
+            try {
+                const bytes = await readBody(response, () => ctx.markProgress(), 8192);
+                const destination = new URL(new TextDecoder().decode(bytes).trim());
+                if (destination.protocol !== 'https:' || destination.username || destination.password
+                    || !/(^|\.)(?:googlevideo|googleusercontent)\.com$/.test(destination.hostname)
+                    || destination.pathname !== '/videoplayback') throw new Error('Not a media redirect');
+                url = destination.href;
+            } catch (error) {
+                if (options.signal?.aborted || error?.name === 'AbortError') throw error;
+                throw Object.assign(new Error('Drive returned a non-media response instead of a media file. Play the video and try Download again.'), { name: 'MediaTransportError' });
+            }
+        }
+        throw Object.assign(new Error('Drive returned too many media redirects. Try Download again.'), { name: 'MediaTransportError' });
     }
 
     function rangeUnsupported(message) {
@@ -174,13 +185,14 @@
 
         for (const probe of probes) {
             try {
-                const response = await fetch(probe.url, {
+                const response = await fetchMedia(probe.url, {
                     credentials: 'include',
                     cache: 'no-store',
                     signal: ctx.signal,
                     headers: probe.headers
-                });
+                }, ctx);
                 ctx.markProgress();
+                requireRawMedia(response);
                 const range = parseContentRange(response.headers.get('content-range'));
                 const length = Number(response.headers.get('content-length')) || 0;
                 if (response.status === 206 && range?.start === 0 && range.end === 0) {
@@ -224,7 +236,7 @@
         const attempts = [
             { mode: 'header', url: baseUrl, headers: { Range: `bytes=${start}-${end}` } },
             { mode: 'query', url: makeRangeQueryURL(baseUrl, start, end), headers: {} }
-        ].filter(attempt => !ctx.rangeMode || attempt.mode === ctx.rangeMode);
+        ].sort((a, b) => Number(b.mode === ctx.rangeMode) - Number(a.mode === ctx.rangeMode));
 
         let lastError = null;
         for (const attempt of attempts) {
@@ -233,13 +245,14 @@
                 let inflight = 0;
                 const onBytes = n => { inflight += n; ctx.markProgress(); ctx.report(inflight); };
 
-                const response = await fetch(attempt.url, {
+                const response = await fetchMedia(attempt.url, {
                     credentials: 'include',
                     cache: 'no-store',
                     signal: ctx.signal,
                     headers: attempt.headers
-                });
+                }, ctx);
                 ctx.markProgress();
+                requireRawMedia(response);
 
                 if (!response.ok && response.status !== 206) {
                     lastError = new Error(`${label} download failed (${response.status})`);
@@ -292,7 +305,9 @@
                 return { data: body, total: range?.total || 0, whole: false };
             } catch (err) {
                 if (err?.name === 'AbortError') throw err;
-                if (err?.name === 'RangeUnsupportedError') throw err;
+                // A failed header request can still have a valid query-range response.
+                // Try the other request form before refreshing the captured source.
+                if (err?.name === 'RangeUnsupportedError' && attempt === attempts[attempts.length - 1]) throw err;
                 lastError = err;
             } finally {
                 // Clear the current attempt's in-flight bytes on failure or
@@ -325,9 +340,10 @@
         // Without ranges an interrupted transfer must start at byte zero.
         await st.disk.reset();
         st.bytes = 0;
-        const response = await fetch(baseUrl, {
+        const response = await fetchMedia(baseUrl, {
             credentials: 'include', cache: 'no-store', signal: ctx.signal
-        });
+        }, ctx);
+        requireRawMedia(response);
         if (!response.ok) throw new Error(`${label} download failed (${response.status})`);
         const declared = Number(response.headers.get('content-length')) || 0;
         const reader = response.body?.getReader?.();
@@ -346,8 +362,9 @@
         } finally {
             try { reader.releaseLock(); } catch (_) {}
         }
-        if (!st.bytes || (declared && st.bytes !== declared)) {
-            throw new Error(`${label} download incomplete (${st.bytes} of ${declared} bytes)`);
+        const expected = Math.max(st.total, declared);
+        if (!st.bytes || st.bytes < expected || (declared && st.bytes !== declared)) {
+            throw Object.assign(new Error(`${label} download incomplete (${st.bytes} of ${expected} bytes)`), { name: 'IncompleteStreamError' });
         }
         st.total = st.bytes;
         ctx.report(0, true);
@@ -563,13 +580,13 @@
 
     function makeReporter(jobId, label, st) {
         let last = 0;
-        return (inflight = 0, force = false) => {
+        return (inflight = 0, force = false, complete = false) => {
             const now = performance.now();
             if (!force && now - last < 200) return;
             last = now;
             const total = st.total;
             const received = total > 0 ? Math.min(st.bytes + inflight, total) : st.bytes + inflight;
-            postStageMessage('videoStageProgress', { jobId, label, received, total: total || received });
+            return postStageMessage('videoStageProgress', { jobId, label, received, total, complete });
         };
     }
 
@@ -627,7 +644,7 @@
      */
     async function downloadStream(url, totalHint, label, job, parentSignal, rt) {
         const jobId = job.jobId;
-        const baseUrl = cleanStageURL(url);
+        let baseUrl = cleanStageURL(url);
         const st = {
             bytes: 0, total: Math.max(0, Number(totalHint) || 0),
             probed: false, rangeMode: null, parallelChunks: null,
@@ -635,54 +652,94 @@
         };
         const report = makeReporter(jobId, label, st);
         let autoRestarts = 0;
+        let sourceRefreshes = 0;
 
-        for (;;) {
-            throwIfCancelled(jobId);
-            const attempt = beginAttempt(parentSignal, rt);
-            try {
-                await pullStream(st, baseUrl, label, {
-                    jobId,
-                    signal: attempt.signal,
-                    report,
-                    markProgress: attempt.markProgress
-                });
-
-                if (st.bytes !== st.total || st.bytes <= 0) {
-                    throw new Error(`${label} download incomplete (${st.bytes} of ${st.total} bytes)`);
-                }
-                const blob = await st.disk.finish();
-                if (blob.size !== st.bytes) throw new Error(`${label} temporary file was incomplete.`);
-                report(0, true);
-                return { blob, bytes: st.bytes, total: st.total };
-            } catch (err) {
-                if (cancelledJobs.has(jobId)) throw abortError();
-
-                if (attempt.manual) {
-                    postStageMessage('videoStageStatus', {
-                        jobId, stage: 'download', message: `Restarting ${label} download…`
+        try {
+            for (;;) {
+                throwIfCancelled(jobId);
+                if (parentSignal.aborted) throw abortError();
+                const attempt = beginAttempt(parentSignal, rt);
+                try {
+                    await pullStream(st, baseUrl, label, {
+                        jobId,
+                        signal: attempt.signal,
+                        report,
+                        markProgress: attempt.markProgress
                     });
-                    continue;
-                }
-                if (attempt.stuck) {
-                    if (autoRestarts < MAX_STUCK_RESTARTS) {
-                        autoRestarts++;
+
+                    if (st.bytes !== st.total || st.bytes <= 0) {
+                        throw new Error(`${label} download incomplete (${st.bytes} of ${st.total} bytes)`);
+                    }
+                    const blob = await st.disk.finish();
+                    if (blob.size !== st.bytes) throw new Error(`${label} temporary file was incomplete.`);
+                    // A successful HTTP response can still be an initialization segment or error body.
+                    const metadata = job.mode === 'single' && /webm/i.test(job.mediaMime || '')
+                        ? null
+                        : await window.GDriveVideoMedia.inspect(blob, label, () => {
+                            throwIfCancelled(jobId);
+                            if (attempt.signal.aborted) throw abortError();
+                            attempt.markProgress();
+                        });
+                    await report(0, true, true);
+                    return { blob, bytes: st.bytes, total: st.total, metadata };
+                } catch (err) {
+                    if (cancelledJobs.has(jobId) || parentSignal.aborted) throw abortError();
+
+                    if (attempt.manual) {
                         postStageMessage('videoStageStatus', {
                             jobId, stage: 'download', message: `Restarting ${label} download…`
                         });
                         continue;
                     }
-                    postStageMessage('videoStageStatus', {
-                        jobId, stage: 'download', message: `${label} download stalled. Waiting for restart…`
-                    });
-                    await waitForManualRestart(rt, parentSignal);
-                    autoRestarts = 0;
-                    continue;
+                    if (sourceRefreshes < 1 && ['MediaTransportError', 'IncompleteStreamError', 'MediaValidationError'].includes(err?.name)) {
+                        sourceRefreshes++;
+                        postStageMessage('videoStageStatus', {
+                            jobId, stage: 'download', message: 'Capturing fresh stream URLs…'
+                        });
+                        try {
+                            const fresh = await chrome.runtime.sendMessage({ type: 'refreshVideoStageStreams', jobId });
+                            throwIfCancelled(jobId);
+                            if (parentSignal.aborted) throw abortError();
+                            const nextUrl = fresh?.[label === 'audio' ? 'audioUrl' : 'videoUrl'];
+                            if (!fresh?.success || !nextUrl) throw err;
+                            await st.disk.abort();
+                            st.disk = await window.GDriveVideoDiskStorage.createStream(jobId, label);
+                            st.bytes = 0;
+                            st.total = Math.max(0, Number(fresh[label === 'audio' ? 'audioBytes' : 'videoBytes']) || st.total);
+                            st.parallelChunks = null;
+                            st.probed = false;
+                            st.rangeMode = null;
+                            baseUrl = cleanStageURL(nextUrl);
+                            report(0, true);
+                            continue;
+                        } catch (refreshError) {
+                            if (cancelledJobs.has(jobId) || parentSignal.aborted) throw abortError();
+                            throw err;
+                        }
+                    }
+                    if (attempt.stuck) {
+                        if (autoRestarts < MAX_STUCK_RESTARTS) {
+                            autoRestarts++;
+                            postStageMessage('videoStageStatus', {
+                                jobId, stage: 'download', message: `Restarting ${label} download…`
+                            });
+                            continue;
+                        }
+                        postStageMessage('videoStageStatus', {
+                            jobId, stage: 'download', message: `${label} download stalled. Waiting for restart…`
+                        });
+                        await waitForManualRestart(rt, parentSignal);
+                        autoRestarts = 0;
+                        continue;
+                    }
+                    throw err;
+                } finally {
+                    attempt.dispose();
                 }
-                await st.disk.abort();
-                throw err;
-            } finally {
-                attempt.dispose();
             }
+        } finally {
+            // Close every writer before job cleanup, including cancellation and restart waits.
+            await st.disk.abort();
         }
     }
 
@@ -711,6 +768,7 @@
         jobControllers.set(job.jobId, controller);
         const rt = { attempts: new Set(), waiters: new Set() };
         jobRuntime.set(job.jobId, rt);
+        const streams = [];
 
         try {
             throwIfCancelled(job.jobId);
@@ -722,15 +780,16 @@
                 return { mediaBlob: media.blob, videoBlob: media.blob, audioBlob: null, mediaBlobInfo: media };
             }
 
-            // Both streams must finish (or one must fail) before anything else happens.
-            const [video, audio] = await Promise.all([
+            streams.push(
                 downloadStream(job.videoUrl, job.videoBytes || 0, 'video', job, controller.signal, rt),
                 downloadStream(job.audioUrl, job.audioBytes || 0, 'audio', job, controller.signal, rt)
-            ]);
+            );
+            const [video, audio] = await Promise.all(streams);
             return { videoBlob: video.blob, audioBlob: audio.blob, mediaBlob: null, video, audio };
         } catch (error) {
-            // One stream failed: stop the other instead of letting it keep downloading.
-            try { controller.abort(); } catch (_) {}
+            // Stop the sibling stream and wait for its writer to close before removing files.
+            controller.abort();
+            await Promise.allSettled(streams);
             throw error;
         } finally {
             jobRuntime.delete(job.jobId);
@@ -764,6 +823,10 @@
                         throw new Error('A stream did not finish downloading. Please try again.');
                     }
                 }
+
+                if (job.mode !== 'single') window.GDriveVideoMedia.validatePair(sources.video.metadata, sources.audio.metadata);
+                // Deliver this gate before any merger status reaches the overlay.
+                await postStageMessage('videoStageSourcesReady', { jobId });
 
                 if (job.mode === 'single') {
                     await window.GDriveVideoProcessor.processSingle(job, sources.mediaBlob);

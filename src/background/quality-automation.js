@@ -31,22 +31,6 @@ async function resumePlaybackAfterQualitySwitch(tabId) {
 /**
  * Repeatedly attempts to find and click a specific UI menu item by text label.
  *
- * HOW IT WORKS:
- * 1. Computes an absolute timestamp deadline (at least 1500ms, default 7000ms).
- * 2. Scopes execution to `preferredFrameId` if provided; otherwise searches all frames.
- * 3. Polling loop:
- *    - Optionally calls `revealControls` to simulate mouse movement over player.
- *    - Dispatches `clickLabel` with target label strings.
- *    - If clicked successfully (`firstOk`), returns immediately with the frameId and label.
- *    - Otherwise sleeps 120ms before retrying.
- * 4. Returns `{ ok: false }` if deadline expires without success.
- *
- * COMPLICATION & CAN BE WRITTEN IN A BETTER WAY:
- * - Fixed polling (120ms sleep): If the menu is slow to render (e.g. slow connection),
- *   this sends up to ~58 `executeScript` IPC messages per 7 seconds. An event-driven
- *   or MutationObserver callback from the content script would be more efficient than
- *   repeated polling from the background worker.
- *
  * @param {number} tabId - Browser tab ID
  * @param {Array<string>} labels - List of label variants to match (e.g. ["Quality", "Calidad", "Qualité"])
  * @param {string} labelName - Display name used for diagnostic error messages
@@ -95,14 +79,6 @@ async function clickMenuLikeMini(tabId, labels, labelName, timeoutMs, reveal = f
 
 /**
  * Automates opening Settings, expanding the Quality sub-menu, and clicking a specific resolution.
- *
- * HOW IT WORKS:
- * 1. Sets a deadline (min 1500ms, default 7000ms).
- * 2. Calls `clickQuality` via `runQualityDom`, passing the desired resolution height (e.g. 1080) and label.
- * 3. The content script handles opening the gear icon, locating the quality item, and clicking it.
- * 4. If confirmed clicked, pauses 200ms to allow Google Drive's player to register the click,
- *    then returns success with the target frameId.
- * 5. If not yet clicked, sleeps 150ms and retries until timeout.
  *
  * @param {number} tabId - Target tab ID
  * @param {string} label - Target quality text (e.g. "1080p", "720p HD", "360p")

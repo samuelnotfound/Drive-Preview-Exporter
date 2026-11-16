@@ -9,18 +9,6 @@
 /**
  * Generates a stable unique deduplication key for a video/audio stream URL.
  *
- * HOW IT WORKS:
- * 1. Checks if the stream URL contains Google video stream parameters:
- *    - `itag`: Google's media format identifier (e.g. 137 for 1080p, 140 for 128k audio)
- *    - `id`: Unique media session identifier
- * 2. If present, returns `itag:<itag>|id:<id>`.
- * 3. Otherwise, strips range/query noise using `cleanURL` and returns the normalized URL.
- *
- * PURPOSE:
- * Google Drive requests video in small ranged segments (e.g. range=0-1000000).
- * Different chunks of the exact same video stream have identical `itag` and `id`.
- * This key ensures we treat all chunks of the same stream as one logical format.
- *
  * @param {Object} stream - Stream object containing url or originalUrl
  * @returns {string} Unique stream key or cleaned URL
  */
@@ -41,22 +29,6 @@ function streamUrlKey(stream) {
 
 /**
  * Polls for an incoming video stream captured after a quality click was performed.
- *
- * HOW IT WORKS:
- * 1. Calculates a deadline (min 800ms, default 2500ms).
- * 2. Pulls captured streams from both `state.probeBuffer` and `state.recentStreams`.
- * 3. Filters out audio streams, sorting newest first.
- * 4. Filters by:
- *    - Captured timestamp: Must be captured after `clickAt - 50ms` (grace period for slight clock drift).
- *    - Probe token: Must match active probe token if one was tagged.
- *    - usedUrls: Excludes previously matched streams.
- *    - Height matching: Checks if vertical resolution matches requested height.
- *
- * COMPLICATION & ARCHITECTURAL DETAIL:
- * Why `Math.abs(sh - h) > 8`?
- * Video encoding standards (AVC/H.264) often require dimensions to be divisible by
- * macroblock boundaries (16x16 pixels). For example, a 1080p stream may report an
- * encoded height of 1088px. The 8-pixel tolerance prevents false negatives.
  *
  * @param {number} tabId - Browser tab ID
  * @param {string} probeToken - Unique probe token
@@ -125,13 +97,6 @@ async function nudgePlaybackAfterQualitySwitch(tabId) {
 
 /**
  * Attaches the shared audio stream to the tab's active video session.
- *
- * HOW IT WORKS & PURPOSE:
- * Google Drive uses adaptive DASH/separate streams for video and audio.
- * A 1080p video stream has no embedded audio. The downloader must pair the video
- * stream with an audio stream to produce a complete MP4 file.
- * This function persists the selected audio track to `session.audio`, adds it to
- * `audioCandidates`, and establishes `formats.audio` in storage.
  *
  * @param {number} tabId - Target tab ID
  * @param {Object} audio - Captured audio stream descriptor

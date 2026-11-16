@@ -18,7 +18,7 @@
     const STAGE_MESSAGES = new Set([
         'videoFormatsDetected', 'videoStreamDetected',
         'videoStagePreload', 'videoStageStarted', 'videoStageStatus', 'videoStageProgress', 'videoStageChunkProgress',
-        'videoStageMergeProgress', 'videoStageDownloadStarted', 'videoStageFinished',
+        'videoStageSourcesReady', 'videoStageMergeProgress', 'videoStageDownloadStarted', 'videoStageFinished',
         'videoStageError', 'videoStageCancelled', 'videoStageRestarted'
     ]);
 
@@ -714,9 +714,12 @@
 
     function handleVideoStageMessage(message) {
         const activeJob = videoOverlay.getJobId();
-        if (activeJob && message.jobId && activeJob !== message.jobId) return;
+        if (!activeJob || !message.jobId || activeJob !== message.jobId) return;
 
         switch (message.type) {
+            case 'videoStageSourcesReady':
+                videoOverlay.update({ stage: 'verified', jobId: message.jobId });
+                break;
             case 'videoStageStatus':
                 if (message.stage === 'staged' || message.stage === 'merge') {
                     videoOverlay.update({ stage: 'merge', progress: message.stage === 'staged' ? 0 : undefined });
@@ -728,7 +731,7 @@
                 videoOverlay.setJob(message.jobId || activeJob, message.videoBytes || message.mediaBytes || 0, message.audioBytes || 0);
                 break;
             case 'videoStageProgress':
-                videoOverlay.update({ label: message.label, received: message.received, total: message.total });
+                videoOverlay.update({ jobId: message.jobId, label: message.label, received: message.received, total: message.total, complete: message.complete });
                 break;
             case 'videoStageChunkProgress':
                 videoOverlay.updateChunks?.(message);

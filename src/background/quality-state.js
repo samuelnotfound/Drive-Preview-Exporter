@@ -9,19 +9,6 @@
 /**
  * Initiates a quality probe session for a given tab.
  *
- * HOW IT WORKS:
- * 1. Generates a unique probe token combining timestamp and random alphanumeric string.
- * 2. Queues a mutation to the persisted tab session in storage:
- *    - Validates fileId matches current session to prevent cross-file race conditions.
- *    - Stores `activeQualityProbe` metadata and clears old probe candidates.
- *    - Enables network stream capture flag.
- * 3. If storage mutation was accepted, initializes in-memory probe buffer in `streamCaptureState`.
- *
- * COMPLICATION & ARCHITECTURAL FIX:
- * Earlier versions updated the in-memory state unconditionally before the storage write.
- * If the storage mutation was rejected (e.g., fileId mismatch due to navigation),
- * memory and storage diverged. Setting memory only when `accepted === true` guarantees consistency.
- *
  * @param {number} tabId - Browser tab ID
  * @param {string} fileId - Google Drive file ID
  * @param {string} label - The human-readable quality label (e.g. "1080p", "720p", "Auto")
@@ -65,16 +52,6 @@ async function beginQualityProbe(tabId, fileId, label) {
 /**
  * Segregates stream candidates into video vs audio categories.
  *
- * HOW IT WORKS & PURPOSE:
- * 1. Filters items matching the active probe token (or keeps all if token is empty).
- * 2. Uses `isAudioStream` helper to distinguish audio from video.
- * 3. Identifies video candidates via mime type regex (`/video/i`), numeric height, or itag.
- *
- * COMPLICATION IN GOOGLE DRIVE:
- * Google Drive's video player often omits standard `Content-Type: video/mp4` headers
- * or returns generic mime types on chunk segments. Checking itags and non-zero height
- * ensures video streams are correctly classified even when mime headers are missing.
- *
  * @param {Array<Object>} all - Array of captured stream metadata objects
  * @param {string} token - Probe token to filter by
  * @returns {{video: Array<Object>, audio: Array<Object>}}
@@ -100,13 +77,6 @@ function filterProbeCandidates(all = [], token = '') {
 
 /**
  * Concludes an active quality probe, aggregating collected video and audio streams.
- *
- * HOW IT WORKS:
- * 1. Reads captured streams from the in-memory buffer (`state.probeBuffer`).
- * 2. Atomically updates stored session: checks probe token matches, combines stored
- *    and in-memory candidates, clears `activeQualityProbe`, and disables capture if playback not active.
- * 3. Clears in-memory active probe and buffer.
- * 4. Deduplicates and sorts the resulting video formats (by height then size) and audio formats (by size desc).
  *
  * @param {number} tabId - Browser tab ID
  * @param {string} token - The probe token to finalize
@@ -152,13 +122,6 @@ async function endQualityProbe(tabId, token) {
 
 /**
  * Finds the best available audio stream candidate for the current tab session.
- *
- * HOW IT WORKS:
- * 1. Pools audio candidates from persisted storage (`session.audioCandidates`)
- *    and ephemeral in-memory streams (`state.recentStreams`).
- * 2. Filters out empty URLs and deduplicates via `dedupeAudioFormats`.
- * 3. Sorts by content length descending (highest bitrate/full file first),
- *    using captured timestamp as a tie-breaker.
  *
  * @param {number} tabId - Browser tab ID
  * @returns {Promise<Object|null>} The best audio stream candidate or null

@@ -18,10 +18,6 @@ const sessionChangedResponse = () => ({ success: false, error: 'The current Driv
 /**
  * Higher-order middleware function ensuring a valid integer `tabId` exists in context.
  *
- * HOW IT WORKS:
- * Wraps an action handler with a check: `Number.isInteger(ctx.tabId)`.
- * If valid, delegates to `handler(ctx)`. Otherwise, returns `unauthorizedResponse()`.
- *
  * @param {Function} handler - Inner handler function
  * @param {Function} [unauthorizedResponse=invalidTabResponse] - Fallback response generator
  * @returns {Function}
@@ -141,12 +137,6 @@ async function handleClearQualityPickerSnapshot({ request }) {
 /**
  * Action: setVideoContext
  * Initializes or updates the active video session when content script binds to a Drive page.
- *
- * HOW IT WORKS:
- * 1. Checks if current tab session exists and whether fileId/viewerSessionId changed.
- * 2. If changed, resets to a fresh `emptySession()`.
- * 3. Immediately enables `streamCaptureEnabled = true` so pre-download playback captures formats.
- * 4. Clears toolbar action badge if context changed.
  */
 async function handleSetVideoContext({ request, tabId }) {
     const fileId = String(request.fileId || '').trim();
@@ -264,13 +254,6 @@ function addCapturedStreamToSession(session, candidate, isAudio) {
 /**
  * Action: pageStreamDetected
  * Receives stream detection messages from content script fetch/XHR hooks (network-bridge.js).
- *
- * HOW IT WORKS:
- * 1. Parses stream URL into structured candidate.
- * 2. Tags candidate into in-memory probe buffer immediately (ensures zero-latency matching).
- * 3. Validates against active session.
- * 4. Persists format into storage session.
- * 5. Updates badge to "ON" and broadcasts `videoStreamDetected` to tab UI.
  */
 async function handlePageStreamDetected({ request, tabId }) {
     const url = String(request.url || '').trim();
@@ -351,14 +334,6 @@ async function handlePageStreamDetected({ request, tabId }) {
 /**
  * Action: listPlayerQualityLabels
  * Opens the Drive video player's Settings -> Quality menu and reads all available resolution options.
- *
- * HOW IT WORKS:
- * 1. Checks `QUALITY_SCAN_TAB_LOCK` to ensure no other scan is executing concurrently.
- * 2. Reveals player controls, clicks "Settings", then clicks "Quality".
- * 3. Dispatches `scanQualities` DOM action into all frames to inspect popup list items.
- * 4. Extracts heights (e.g. 1080, 720, 480, 360) and labels.
- * 5. Closes the player menu so UI returns to normal.
- * 6. Returns list of available resolutions sorted highest first.
  */
 async function handleListPlayerQualityLabels({ request, tabId }) {
     const existing = QUALITY_SCAN_TAB_LOCK.get(tabId);
@@ -492,6 +467,7 @@ async function handleListPlayerQualityLabels({ request, tabId }) {
  * 5. Returns both streams ready for download.
  */
 async function handleCaptureQualityForDownload({ request, tabId }) {
+    const forceFresh = request.forceFresh === true;
     const height = Number(request.qualityHeight || request.height || 0);
     const label = String(request.qualityLabel || request.label || (height ? `${height}p` : '')).trim();
     if (!height && !label) {
@@ -547,7 +523,7 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
             let video = null;
             try {
                 // Wait for network capture matching probe
-                video = await waitForQualityStream(tabId, probe.token, height, (typeof FAST_SCAN !== "undefined" ? FAST_SCAN.streamWaitMs : 1500), new Set(), clickAt);
+                video = await waitForQualityStream(tabId, probe.token, height, (forceFresh ? 6000 : (typeof FAST_SCAN !== "undefined" ? FAST_SCAN.streamWaitMs : 1500)), new Set(), clickAt);
                 if (!video?.url) {
                     const recentAfter = (streamCaptureState(tabId)?.recentStreams || [])
                         .filter(s => s?.url && !isAudioStream(s) && Number(s.capturedAt || 0) >= clickAt - 50)
@@ -555,11 +531,11 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
                     video = recentAfter[0] || null;
                 }
                 // Fallback to already playing stream if Drive didn't fire a new request
-                if (!video?.url && alreadyPlaying?.url) {
+                if (!forceFresh && !video?.url && alreadyPlaying?.url) {
                     video = alreadyPlaying;
                 }
-                // Final fallback to session video
-                if (!video?.url) {
+                // Recovery must not silently reuse the stale source that just failed.
+                if (!forceFresh && !video?.url) {
                     const session = await getStoredSession(tabId);
                     if (session?.video) {
                         const h = Number(
@@ -620,10 +596,10 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
                 .filter(s => s?.url && isAudioStream(s))
                 .sort((a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0));
             const audioAfterClick = recentAudio.find(s => Number(s.capturedAt || 0) >= clickAt - 50) || null;
-            let audio = audioAfterClick
+            let audio = forceFresh ? audioAfterClick : (audioAfterClick
                 || recentAudio[0]
                 || await getCurrentSessionAudioCandidate(tabId)
-                || (typeof getGlobalLastAudio === 'function' ? getGlobalLastAudio() : null);
+                || (typeof getGlobalLastAudio === 'function' ? getGlobalLastAudio() : null));
             if (audio?.url) {
                 audio = {
                     ...audio,
@@ -1053,7 +1029,8 @@ const ACTION_HANDLERS = Object.freeze({
  * Map of handlers keyed by `request.type`.
  */
 const TYPE_HANDLERS = Object.freeze({
-    getVideoStageJob: handleGetVideoStageJob
+    getVideoStageJob: handleGetVideoStageJob,
+    refreshVideoStageStreams
 });
 
 /**
@@ -1085,11 +1062,6 @@ async function handleRuntimeMessage(request = {}, sender = {}) {
 
 /**
  * Root Chrome Extension message listener.
- *
- * HOW IT WORKS:
- * - Registered on `chrome.runtime.onMessage`.
- * - Returning `true` informs Chrome that `sendResponse` will be called asynchronously!
- * - Catches any uncaught Promise rejections and replies with `{ success: false, error }`.
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // These commands are for the offscreen document. Do not reply from the

@@ -8,27 +8,11 @@
 
 /**
  * Last known URL per tab — used to detect navigation, SPA route changes, and reloads.
- *
- * HOW IT WORKS:
- * Key: tabId (number), Value: url (string).
- *
- * ARCHITECTURAL NOTE / CAN BE WRITTEN IN A BETTER WAY:
- * In Manifest V3, background service workers are ephemeral and will terminate
- * after ~30 seconds of inactivity. When the service worker restarts, in-memory
- * Maps like TAB_URL_BY_ID are reset to empty. If an update occurs after worker
- * restart, `previousUrl` will be empty.
- * Better way: Store tab URLs in `chrome.storage.session` so that last-known URLs
- * survive service worker idle termination cycles across the lifetime of the tab.
  */
 const TAB_URL_BY_ID = new Map();
 
 /**
  * Extracts a Google Drive file ID from a viewer URL when possible.
- *
- * HOW IT WORKS & PURPOSE:
- * 1. Checks if the URL belongs to google drive (e.g. drive.google.com).
- * 2. Parses path for the canonical format: "/file/d/<FILE_ID>/view".
- * 3. Falls back to query parameter patterns: "?id=<FILE_ID>" or "?fileId=<FILE_ID>".
  *
  * @param {string} url - The URL to inspect
  * @returns {string} The extracted file ID, or '' if not found / invalid
@@ -67,10 +51,6 @@ function driveFileIdFromUrl(url) {
  *
  * PURPOSE:
  * Quickly verifies whether a navigation target is within Google Drive ecosystem.
- *
- * CAN BE WRITTEN IN A BETTER WAY:
- * `driveFileIdFromUrl` and `isDriveHost` duplicate the hostname check.
- * `isDriveHost` can be reused inside `driveFileIdFromUrl` to keep the logic DRY.
  *
  * @param {string} url - URL to check
  * @returns {boolean} True if Google Drive hostname
@@ -261,17 +241,6 @@ try {
         // Safely extract URL
         const url = String(details.url || '');
 
-        // ------------------------------------------------------------------------
-        // CAN BE WRITTEN IN A BETTER WAY / REDUNDANCY COMMENT:
-        // Originally written as:
-        //   details.transitionType === 'reload' ||
-        //   (Array.isArray(details.transitionQualifiers) &&
-        //       details.transitionQualifiers.includes('client_redirect') === false &&
-        //       details.transitionType === 'reload');
-        // Notice that `details.transitionType === 'reload'` was present on both sides
-        // of the || operator! In boolean logic: A || (B && C && A) is equivalent to A.
-        // Simplified check:
-        // ------------------------------------------------------------------------
         const isReload = details.transitionType === 'reload';
 
         // Retrieve previously recorded URL and update to current URL
@@ -298,15 +267,6 @@ try {
  *
  * PURPOSE:
  * Cleans up memory and halts active download/remux jobs when the user closes a tab.
- *
- * HOW IT WORKS:
- * 1. Removes tabId from URL tracking Map.
- * 2. Launches an async IIFE to abort active video chunk jobs and clear stored session.
- *
- * CAN BE WRITTEN IN A BETTER WAY:
- * Note that `clearTabMediaState(tabId)` already calls `cancelJobsForTab(tabId)`.
- * Calling `cancelJobsForTab(tabId)` directly before `clearTabMediaState` is redundant,
- * but keeps cancellation high-priority in case `clearTabMediaState` throws early.
  */
 chrome.tabs.onRemoved.addListener(tabId => {
     // Free in-memory URL tracker for this tab

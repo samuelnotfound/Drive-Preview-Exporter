@@ -138,17 +138,6 @@ loadGlobalStreamsFromStorage();
 /**
  * Lightweight classification of media streams (audio vs video).
  *
- * HOW IT WORKS:
- * 1. Checks for `mime=audio` in URL or candidate mime property.
- * 2. Checks against `AUDIO_ITAG_PATTERN` if loaded.
- * 3. Checks for Google Drive's audio output query param `ot=a`.
- * 4. Checks `isAudioStream` helper.
- * 5. Defaults to "video".
- *
- * NOTE ON LOAD ORDER:
- * Defined here because network-capture.js is loaded before format-catalog.js
- * in src/background.js.
- *
  * @param {string} url - Stream URL
  * @param {Object} candidate - Parsed candidate object
  * @returns {'audio'|'video'}
@@ -166,12 +155,6 @@ function classifySimple(url, candidate) {
 
 /**
  * Inserts a candidate into the tab's recent streams ring buffer.
- *
- * HOW IT WORKS:
- * 1. Derives a deduplication key using itag (e.g. "video|itag:137") or URL.
- * 2. Removes any older instance with the exact same key.
- * 3. Adds the fresh stream to the front of the list (`unshift`).
- * 4. Truncates the ring buffer to `RECENT_STREAM_LIMIT` (96 items).
  *
  * @param {number} tabId - Browser tab ID
  * @param {Object} candidate - Stream descriptor
@@ -339,14 +322,6 @@ function addToProbeBuffer(state, candidate) {
 /**
  * Atomically stores a newly captured stream into the persisted tab session.
  *
- * HOW IT WORKS:
- * 1. Queues a mutation to `sessionsQueue`.
- * 2. If a probe is active, stamps candidate and updates `session.probeCandidates`.
- * 3. Classifies stream kind:
- *    - Audio: Updates `current.audio`, adds to `audioCandidates`, updates `formats.audio`.
- *    - Video: Updates `current.video`, adds to `videoCandidates`, merges into `formats.video` or `formats.progressive`.
- * 4. Sets `playbackStarted = true` and `streamCaptureEnabled = true`.
- *
  * @param {number} tabId - Browser tab ID
  * @param {Object} session - Current session snapshot
  * @param {Object} candidate - Captured stream descriptor
@@ -475,11 +450,6 @@ function shouldUpdateGlobal(tabId, session) {
 
 /**
  * Remembers a request ID to prevent duplicate processing within 15 seconds.
- *
- * HOW IT WORKS:
- * 1. Cleans expired entries when the Map grows beyond 200 items.
- * 2. Returns `true` if requestId was already observed within the TTL.
- * 3. Otherwise records requestId with expiration timestamp and returns `false`.
  *
  * @param {string} requestId - Chrome webRequest ID
  * @returns {boolean} True if request was already processed

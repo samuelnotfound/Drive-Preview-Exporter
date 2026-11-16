@@ -1,7 +1,7 @@
 // ============================================================================
 // FILE: src/background/video-jobs.js
 // PURPOSE: Resolve selected streams, create a download job, open the offscreen
-//          document, and start sequential 4 MiB range downloads + remux.
+//          document, and start disk-backed stream downloads and MP4 remuxing.
 // ============================================================================
 
 let offscreenLock = Promise.resolve();
@@ -350,4 +350,39 @@ async function startVideoDownload(tabId, request = {}) {
         if (jobId) await removeVideoStageJob(jobId);
         return { success: false, error: error?.message || String(error) };
     }
+}
+
+// Coalesce simultaneous audio/video failures into one player recapture.
+const sourceRefreshes = new Map();
+function refreshVideoStageStreams({ request }) {
+    const jobId = String(request.jobId || '');
+    if (sourceRefreshes.has(jobId)) return sourceRefreshes.get(jobId);
+    const work = (async () => {
+        const job = (await getStoredJobs())[jobId];
+        if (!job || job.mode !== 'adaptive') return { success: false, error: 'No active adaptive download.' };
+        const session = await getStoredSession(job.sourceTabId);
+        if (!session || validateDownloadContext(session, job)) return { success: false, error: 'The Drive viewer changed.' };
+        const height = Number(parseStreamCandidate(job.videoUrl)?.height || 0);
+        if (!height) return { success: false, error: 'Could not identify the selected quality.' };
+        const capture = await handleCaptureQualityForDownload({
+            tabId: job.sourceTabId,
+            request: { fileId: job.fileId, qualityHeight: height, qualityLabel: height + 'p', forceFresh: true }
+        });
+        if (!capture?.success || !capture.video?.url || !capture.audio?.url) {
+            return { success: false, error: 'Fresh video and audio streams were not captured. Play the video and try Download again.' };
+        }
+        const current = await getStoredSession(job.sourceTabId);
+        if (!current || validateDownloadContext(current, job)) return { success: false, error: 'The Drive viewer changed.' };
+        const payload = createStagePayload({ mode: 'adaptive', video: capture.video, audio: capture.audio }, job.filename);
+        let updated = false;
+        await queueJobMutation(jobs => {
+            if (!jobs[jobId]) return false;
+            Object.assign(jobs[jobId], payload);
+            updated = true;
+        });
+        return updated ? { success: true, ...payload } : { success: false, error: 'The download was cancelled.' };
+    })();
+    sourceRefreshes.set(jobId, work);
+    void work.finally(() => { if (sourceRefreshes.get(jobId) === work) sourceRefreshes.delete(jobId); }).catch(() => {});
+    return work;
 }

@@ -4,40 +4,9 @@
 //          deduplication, hashing, and sorting logic for audio/video media streams.
 // ============================================================================
 
-/**
- * Strips range parameters (?range=... or &range=...) from a streaming URL.
- *
- * PURPOSE:
- * Google Drive's video player requests video and audio in tiny byte segments
- * using query parameters like `&range=0-1048575`. If the downloader used that URL
- * directly, it would only download the first 1 MB segment! Stripping the `range`
- * parameter allows the downloader's fetch engine to request arbitrary byte ranges
- * via standard HTTP `Range: bytes=X-Y` request headers.
- *
- * CAN BE WRITTEN IN A BETTER WAY:
- * Using regex `value.search(/[?&]range=/i)` followed by `value.slice(0, rangeIndex)`
- * strips everything after the `range` parameter, which could accidentally chop off
- * subsequent valid query parameters (e.g. `&signature=...` or `&expire=...`).
- * While in Google Drive's URL layout `range` is frequently near the end, using
- * `URLSearchParams.delete('range')` is cleaner and preserves other query parameters:
- * ```javascript
- * try {
- *     const u = new URL(url);
- *     u.searchParams.delete('range');
- *     return u.toString();
- * } catch (_) { return url; }
- * ```
- *
- * @param {string} url - Raw stream URL
- * @returns {string|null} URL stripped of range query parameter
- */
+/** Remove byte ranges without changing signed query parameters or their encoding. */
 function cleanURL(url) {
-    if (!url) return null;
-    const value = String(url);
-    // Locate the starting index of ?range= or &range=
-    const rangeIndex = value.search(/[?&]range=/i);
-    // If not found, return original URL; otherwise slice off everything starting at range
-    return rangeIndex === -1 ? value : value.slice(0, rangeIndex);
+    return url ? GDriveStreamURL.withoutRange(url) : null;
 }
 
 /**
@@ -119,12 +88,6 @@ const byHeightWidthThenSize = (a, b) =>
 /**
  * Sanitizes a filename for local disk saving.
  *
- * HOW IT WORKS:
- * 1. Replaces filesystem-reserved characters (\ / : * ? " < > |) with underscores.
- * 2. Strips non-printable ASCII control characters (0x00 - 0x1F).
- * 3. Defaults to 'gdrive-video' if result is blank.
- * 4. Ensures the filename ends with an appropriate video container extension (defaults to .mp4).
- *
  * @param {string} name - Raw file name from Google Drive page/tab title
  * @returns {string} Safe, sanitized filename with video extension
  */
@@ -178,10 +141,6 @@ function emptySession(fileId = '', filename = '', viewerSessionId = '') {
 /**
  * Extracts total stream size in bytes from the 'clen' query parameter in a video URL.
  *
- * HOW IT WORKS:
- * Google video streaming URLs include a `clen` (content-length) parameter specifying
- * the total byte size of the media stream (e.g. `&clen=24589214`).
- *
  * @param {string} url - Stream URL
  * @returns {number} Total bytes or 0 if absent/invalid
  */
@@ -198,16 +157,6 @@ function getStreamBytes(url) {
 /**
  * 32-bit FNV-1a (Fowler-Noll-Vo) non-cryptographic hash function.
  *
- * HOW IT WORKS:
- * Fast, lightweight string hashing:
- * - Offset basis: 2166136261 (0x811c9dc5)
- * - FNV prime: 16777619 (0x01000193), performed via Math.imul for 32-bit integer multiplication.
- * - Converted to an unsigned 32-bit integer via `>>> 0`, then encoded in base-36 (0-9, a-z).
- *
- * PURPOSE:
- * Generates short, deterministic format IDs (e.g. "captured:137:8b1k3") without
- * needing heavy cryptographic libraries.
- *
  * @param {string} value - String to hash
  * @returns {string} Compact base-36 hash string
  */
@@ -223,13 +172,6 @@ function formatHash(value) {
 
 /**
  * Parses a captured network request URL into a structured format candidate descriptor.
- *
- * HOW IT WORKS:
- * 1. Parses URL search parameters (`mime`, `clen`, `itag`, `width`, `height`, `codecs`).
- * 2. Maps known itag numbers to standard resolution dimensions (e.g. 137 -> [1920, 1080]).
- * 3. Prefers explicit dimensions from URL params if present; otherwise falls back to itag lookup.
- * 4. Strips range parameters using `cleanURL`.
- * 5. Generates unique format ID using `formatHash`.
  *
  * @param {string} url - Cleaned or raw stream URL
  * @param {string} [originalUrl=url] - Original URL before range stripping
@@ -301,12 +243,6 @@ function parseStreamCandidate(url, originalUrl = url) {
 
 /**
  * Prepends a new candidate to a format list while enforcing deduplication and max length.
- *
- * HOW IT WORKS:
- * 1. Computes a composite identity string based on itag, dimensions, audio/video kind, and probe label.
- * 2. Filters out existing candidates with identical composite key.
- * 3. Prepends new candidate at the head of the array (most recent first).
- * 4. Caps list to `max` items (default 12).
  *
  * @param {Array<Object>} list - Existing list of candidates
  * @param {Object} candidate - New candidate format descriptor
