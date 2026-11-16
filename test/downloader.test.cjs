@@ -4,6 +4,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 const {test} = require('node:test');
 const {setTimeout:delay} = require('node:timers/promises');
+const {mp4}=require('../test-support/media.cjs');
+const media=fs.readFileSync(path.join(__dirname, '../src/offscreen/video-stage-media.js'), 'utf8');
 const shared = fs.readFileSync(path.join(__dirname, '../src/shared/stream-url.js'), 'utf8');
 const source = fs.readFileSync(path.join(__dirname, '../src/offscreen/video-stage-downloader.js'), 'utf8');
 const abortError = () => Object.assign(new Error('Aborted'), {name:'AbortError'});
@@ -49,13 +51,13 @@ function harness({job={}, fetch, createStream}={}) {
             return Promise.resolve();
         }
     }};
-    vm.runInNewContext(shared + '\n' + source,{window,chrome,fetch,URL,Blob,Uint8Array,AbortController,performance,setTimeout,clearTimeout,setInterval,clearInterval});
+    vm.runInNewContext(shared + '\n' + media + '\n' + source,{window,chrome,fetch,URL,Blob,Uint8Array,AbortController,performance,setTimeout,clearTimeout,setInterval,clearInterval});
     function send(type) { listener({target:'video-offscreen',type,jobId:job.jobId},null,()=>{}); }
     return {start() { send('videoStageStart'); return done.promise; },cancel() { send('videoStageCancelInternal'); },restart() { send('videoStageRestartInternal'); },messages,disks,get removed() {return removed;}};
 }
 
 test('streams a complete non-ranged file to disk before saving', {timeout:3000}, async () => {
-    const bytes=Buffer.from('a complete progressive video');
+    const bytes=mp4();
     const h=harness({fetch:async () => new Response(bytes,{headers:{'content-length':String(bytes.length)}})});
     const result=await h.start();
     assert.equal(result.type,'saved');
@@ -64,8 +66,7 @@ test('streams a complete non-ranged file to disk before saving', {timeout:3000},
 });
 
 test('parallel ranges and short slices produce the exact original bytes', {timeout:5000}, async () => {
-    const bytes=Buffer.alloc(9*1024*1024+17);
-    for (let i=0;i<bytes.length;i++) bytes[i]=i%251;
+    const bytes=mp4({payloadBytes:9*1024*1024+17});
     let requests=0;
     const h=harness({job:{mediaBytes:bytes.length},fetch:async (_url,options) => {
         const match=/bytes=(\d+)-(\d+)/.exec(options.headers.Range);
@@ -81,7 +82,7 @@ test('parallel ranges and short slices produce the exact original bytes', {timeo
 });
 
 test('falls back to a whole stream if the server stops honoring ranges', {timeout:3000}, async () => {
-    const bytes=Buffer.from('the complete stream');
+    const bytes=mp4();
     const h=harness({job:{mediaBytes:bytes.length},fetch:async (_url,options) => {
         if (options.headers?.Range==='bytes=0-0') return new Response(bytes.subarray(0,1),{status:206,headers:{'content-range':`bytes 0-0/${bytes.length}`}});
         return new Response(bytes,{headers:{'content-length':String(bytes.length)}});
@@ -134,7 +135,7 @@ test('cancelling while temporary storage opens still closes its writer', {timeou
 });
 
 test('an interrupted response is never handed to the MP4 processor', {timeout:3000}, async () => {
-    const h=harness({fetch:async () => new Response('short',{headers:{'content-length':'100'}})});
+    const h=harness({fetch:async () => new Response(Buffer.from('short'),{headers:{'content-length':'100'}})});
     const result=await h.start();
     assert.equal(result.type,'videoStageError');
     assert.match(result.message,/incomplete/);
@@ -143,7 +144,7 @@ test('an interrupted response is never handed to the MP4 processor', {timeout:30
 });
 
 test('player UMP URLs are normalized to raw tracks before network requests', {timeout:3000}, async () => {
-    const bytes=Buffer.from('a raw media track');
+    const bytes=mp4();
     const h=harness({job:{mediaUrl:'https://example.com/video?ump=1&range=3-9&sig=a%2fb%20c+z',mediaBytes:bytes.length},fetch:async (url,options) => {
         assert.equal(new URL(url).searchParams.has('ump'),false);
         assert.ok(url.includes('sig=a%2fb%20c+z'),'signed query encoding must survive normalization');
@@ -164,4 +165,68 @@ test('unexpected player transport is rejected before writing or merging it', {ti
     assert.equal(h.disks.get('video').bytes.length,0);
     assert.equal(h.disks.get('video').closed,true);
     assert.equal(h.removed,true);
+});
+
+test('a tiny audio response cannot replace the expected whole-track size', {timeout:3000}, async () => {
+    const video=mp4(), audio=mp4({kind:'audio'});
+    const h=harness({job:{mode:'adaptive',videoBytes:video.length,audioBytes:100000},fetch:async(url,options)=>{
+        if(options.headers)return new Response(null,{status:400});
+        const body=url.includes('/audio')?audio:video;
+        return new Response(body,{headers:{'content-length':String(body.length)}});
+    }});
+    const result=await h.start();
+    assert.equal(result.type,'videoStageError');assert.match(result.message,/audio download incomplete/);
+    assert.equal(h.messages.some(m=>m.type==='videoStageSourcesReady'||m.stage==='staged'),false);
+});
+test('a successful HTML response is rejected instead of becoming an audio file', {timeout:3000}, async () => {
+    const h=harness({fetch:async()=>new Response('<html>Sign in again</html>',{headers:{'content-type':'text/html'}})});
+    const result=await h.start();assert.equal(result.type,'videoStageError');assert.match(result.message,/non-media/);
+    assert.equal(h.disks.get('video').bytes.length,0);
+});
+test('initialization-only MP4 and truncated boxes never reach processing', {timeout:3000}, async () => {
+    for(const bytes of [mp4({headerOnly:true}),mp4().subarray(0,-2)]) {
+        const h=harness({fetch:async()=>new Response(bytes)});const result=await h.start();
+        assert.equal(result.type,'videoStageError');assert.match(result.message,/not a complete MP4/);
+        assert.equal(h.messages.some(m=>m.type==='videoStageSourcesReady'),false);
+    }
+});
+test('unknown totals are not invented from bytes received before EOF', {timeout:3000}, async () => {
+    const bytes=mp4(), gate=deferred(), reading=deferred();let phase=0;
+    const h=harness({fetch:async(_url,options)=>{
+        if(options.headers)return new Response(null,{status:400});
+        return new Response(new ReadableStream({async pull(controller){
+            if(phase++===0){controller.enqueue(bytes.subarray(0,40));reading.resolve();}
+            else {await gate.promise;controller.enqueue(bytes.subarray(40));controller.close();}
+        }}));
+    }});
+    const done=h.start();await reading.promise;await delay(10);
+    const progress=h.messages.filter(m=>m.type==='videoStageProgress');
+    assert.ok(progress.length);assert.ok(progress.every(m=>m.total===0&&!m.complete));
+    assert.equal(h.messages.some(m=>m.type==='videoStageSourcesReady'),false);
+    gate.resolve();assert.equal((await done).type,'saved');
+    assert.ok(h.messages.some(m=>m.type==='videoStageProgress'&&m.complete));
+});
+test('processing waits until both tracks finish and their media is validated', {timeout:3000}, async () => {
+    const gate=deferred(),video=mp4(),audio=mp4({kind:'audio'});
+    const h=harness({job:{mode:'adaptive'},fetch:async(url,options)=>{
+        if(options.headers)return new Response(null,{status:400});
+        if(url.includes('/audio'))await gate.promise;
+        return new Response(url.includes('/audio')?audio:video);
+    }});
+    const done=h.start();for(let i=0;i<100&&!h.messages.some(m=>m.label==='video'&&m.complete);i++)await delay(5);
+    assert.ok(h.messages.some(m=>m.label==='video'&&m.complete));
+    assert.equal(h.messages.some(m=>m.type==='videoStageSourcesReady'||m.stage==='staged'),false);
+    gate.resolve();assert.equal((await done).type,'saved');
+    const gateIndex=h.messages.findIndex(m=>m.type==='videoStageSourcesReady');
+    const stageIndex=h.messages.findIndex(m=>m.stage==='staged');assert.ok(gateIndex>=0&&stageIndex>gateIndex);
+});
+test('wrong-kind and mismatched-duration tracks are rejected before merging', {timeout:3000}, async () => {
+    for(const audio of [mp4({kind:'video'}),mp4({kind:'audio',duration:1})]) {
+        const h=harness({job:{mode:'adaptive'},fetch:async(url,options)=>{
+            if(options.headers)return new Response(null,{status:400});
+            return new Response(url.includes('/audio')?audio:mp4({duration:60}));
+        }});
+        assert.equal((await h.start()).type,'videoStageError');
+        assert.equal(h.messages.some(m=>m.type==='videoStageSourcesReady'),false);
+    }
 });

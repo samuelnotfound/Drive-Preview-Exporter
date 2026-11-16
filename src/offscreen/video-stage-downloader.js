@@ -72,9 +72,11 @@
     }
 
     function requireRawMedia(response) {
-        if (!/^application\/vnd\.yt-ump(?:;|$)/i.test(response.headers.get('content-type') || '')) return;
+        const type = response.headers.get('content-type') || '';
+        if (!/^(?:application\/vnd\.yt-ump|text\/|application\/(?:json|xml))/i.test(type)) return;
         try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
-        throw Object.assign(new Error('Drive returned player transport data instead of a media file. Refresh Drive and retry.'), {
+        const message = /yt-ump/i.test(type) ? 'Drive returned player transport data' : 'Drive returned a non-media response';
+        throw Object.assign(new Error(`${message} instead of a media file. Refresh Drive and retry.`), {
             name: 'MediaTransportError'
         });
     }
@@ -336,8 +338,9 @@
         } finally {
             try { reader.releaseLock(); } catch (_) {}
         }
-        if (!st.bytes || (declared && st.bytes !== declared)) {
-            throw new Error(`${label} download incomplete (${st.bytes} of ${declared} bytes)`);
+        const expected = Math.max(st.total, declared);
+        if (!st.bytes || st.bytes < expected || (declared && st.bytes !== declared)) {
+            throw new Error(`${label} download incomplete (${st.bytes} of ${expected} bytes)`);
         }
         st.total = st.bytes;
         ctx.report(0, true);
@@ -553,13 +556,13 @@
 
     function makeReporter(jobId, label, st) {
         let last = 0;
-        return (inflight = 0, force = false) => {
+        return (inflight = 0, force = false, complete = false) => {
             const now = performance.now();
             if (!force && now - last < 200) return;
             last = now;
             const total = st.total;
             const received = total > 0 ? Math.min(st.bytes + inflight, total) : st.bytes + inflight;
-            postStageMessage('videoStageProgress', { jobId, label, received, total: total || received });
+            return postStageMessage('videoStageProgress', { jobId, label, received, total, complete });
         };
     }
 
@@ -644,8 +647,16 @@
                     }
                     const blob = await st.disk.finish();
                     if (blob.size !== st.bytes) throw new Error(`${label} temporary file was incomplete.`);
-                    report(0, true);
-                    return { blob, bytes: st.bytes, total: st.total };
+                    // A successful HTTP response can still be an initialization segment or error body.
+                    const metadata = job.mode === 'single' && /webm/i.test(job.mediaMime || '')
+                        ? null
+                        : await window.GDriveVideoMedia.inspect(blob, label, () => {
+                            throwIfCancelled(jobId);
+                            if (attempt.signal.aborted) throw abortError();
+                            attempt.markProgress();
+                        });
+                    await report(0, true, true);
+                    return { blob, bytes: st.bytes, total: st.total, metadata };
                 } catch (err) {
                     if (cancelledJobs.has(jobId) || parentSignal.aborted) throw abortError();
 
@@ -761,6 +772,10 @@
                         throw new Error('A stream did not finish downloading. Please try again.');
                     }
                 }
+
+                if (job.mode !== 'single') window.GDriveVideoMedia.validatePair(sources.video.metadata, sources.audio.metadata);
+                // Deliver this gate before any merger status reaches the overlay.
+                await postStageMessage('videoStageSourcesReady', { jobId });
 
                 if (job.mode === 'single') {
                     await window.GDriveVideoProcessor.processSingle(job, sources.mediaBlob);

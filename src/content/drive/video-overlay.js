@@ -3,11 +3,12 @@
     const DOWNLOAD_WEIGHT = 1;
     /** No new bytes for this long during download → offer the Restart button. */
     const STALL_MS = 6000;
-    /** No progress for this long while merging/finalizing → treat the job as dead so a new download isn't blocked forever. */
+    /** No progress for this long while merging/finalizing → show a waiting message. */
     const MERGE_STALL_MS = 20000;
     const state = {
         jobId: null,
         stage: 'download',
+        sourcesReady: false,
         merge: 0,
         qualityLabel: '',
         lastProgressAt: Date.now(),
@@ -394,27 +395,12 @@
             }
         });
     }
-    /**
-     * Merging/finalizing has no retry UI of its own — if it stalls (e.g. a
-     * worker wedged on a malformed stream) the overlay would otherwise sit
-     * on "Processing: 100%" forever and the stale jobId would keep blocking
-     * every future download attempt. Give up after MERGE_STALL_MS and
-     * release the lock so the user can simply try again.
-     */
+    // The offscreen worker owns the timeout; the UI must not cancel healthy work after 20 seconds.
     function checkMergeStall() {
-        if (!state.jobId) return;
-        if (state.stage !== 'merge' && state.stage !== 'processing') return;
+        if (!state.jobId || !['merge', 'processing'].includes(state.stage)) return;
         if (Date.now() - state.lastProgressAt < MERGE_STALL_MS) return;
-
-        const jobId = state.jobId;
-        state.jobId = null;
-        setState('error', 'This was taking too long and was stopped. Please try exporting again.', true);
-        announceLocalEnd();
-        try {
-            chrome.runtime.sendMessage({ type: 'videoStageCancel', jobId });
-        } catch (_) {
-            // The page can disappear while we're cleaning up.
-        }
+        const info = document.getElementById('psd-video-progress-detail');
+        if (info) info.textContent = 'Still processing. You can cancel this export.';
     }
     /** Show the Restart button only while a download has made no progress. */
     function syncRestart() {
@@ -460,8 +446,7 @@
     }
     function streamLine(label, received, total) {
         const r = Math.max(0, Number(received) || 0);
-        // Drive often under-reports clen / Content-Range; never show received > total.
-        const t = Math.max(0, Number(total) || 0, r);
+        const t = Math.max(0, Number(total) || 0);
         if (t > 0) return `${label}: ${formatBytes(r)} / ${formatBytes(t)}`;
         if (r > 0) return `${label}: ${formatBytes(r)}`;
         return `${label}: —`;
@@ -495,7 +480,7 @@
         const combinedSize = combinedTotal();
         if (!combinedSize) return 0;
         const combinedDownloaded = Math.min(combinedSize, combinedReceived());
-        return Math.max(0, Math.min(1, combinedDownloaded / combinedSize));
+        return Math.max(0, Math.min(state.sourcesReady ? 1 : 0.99, combinedDownloaded / combinedSize));
     }
     /** Position a chunk at its *file offset*, not in order of completion. */
     function positionChunk(element, start, length, total) {
@@ -515,8 +500,8 @@
         // Use the size verified by the range probe. The URL's original clen
         // hint can be wrong, making four audio chunks look like one tiny bar.
         const total = chunks.enabled ? chunks.total : Math.max(stream.total, chunks.total);
-        const percent = total ? Math.min(100, Math.floor(100 * stream.received / total)) : 0;
-        if (percentLabel) percentLabel.textContent = `${percent}%`;
+        const percent = total ? Math.min(stream.complete ? 100 : 99, Math.floor(100 * stream.received / total)) : 0;
+        if (percentLabel) percentLabel.textContent = total ? `${percent}%` : '…';
         track.setAttribute('aria-valuenow', String(percent));
         track.replaceChildren();
         if (!total) return;
@@ -624,6 +609,7 @@
         const root = ensure();
         if (!root) return false;
         if (!force && stageRank(stage) < stageRank(state.stage)) return false;
+        if (['merge', 'processing', 'started'].includes(stage) && !state.sourcesReady) return false;
         root.classList.remove('downloading', 'processing', 'started', 'completed', 'cancelled', 'error');
         const title = root.querySelector('#psd-video-progress-title');
         const info = root.querySelector('#psd-video-progress-detail');
@@ -661,12 +647,10 @@
             root.classList.add('processing');
             setLinearProgress(100);
         }else if (stage === 'started') {
-            // Chrome accepted the save. Show the requested confirmation immediately;
-            // the background still tracks its actual completion and any failure.
-            title.textContent = 'Video downloaded';
-            info.textContent = '';
+            title.textContent = 'Saving video';
+            info.textContent = 'Waiting for Chrome to finish saving.';
             cancel.style.display = 'none';
-            root.classList.add('completed');
+            root.classList.add('started');
             setLinearProgress(100);
         }else if (stage === 'ready') {
             title.textContent = 'Video downloaded';
@@ -730,6 +714,7 @@
         root.style.display = 'block';
         state.jobId = jobId || null;
         state.stage = 'download';
+        state.sourcesReady = false;
         state.merge = 0;
         state.lastProgressAt = Date.now();
         state.stalled = false;
@@ -754,6 +739,11 @@
     }) {
         const root = ensure();
         if (!root) return;
+        if (msg.jobId && msg.jobId !== state.jobId) return;
+        if (msg.stage === 'verified') {
+            if (state.jobId) state.sourcesReady = true;
+            return;
+        }
 
         if (msg.label === 'video' || msg.label === 'audio') {
             // Ignore late progress after the job has already finished/cancelled.
@@ -775,13 +765,11 @@
                     if (restartBtn) restartBtn.style.display = 'none';
                 }
             }
-            bucket.received = Math.max(bucket.received, incoming);
+            bucket.received = Math.max(0, incoming);
+            bucket.complete = msg.complete === true;
             const reportedTotal = Math.max(0, Number(msg.total) || 0);
-            // New downloader totals replace initial URL estimates in either
-            // direction. The original clen may be too large or too small.
-            if (reportedTotal > 0) bucket.total = reportedTotal;
-            // Keep total at least as large as received so the UI never shows inverted figures.
-            if (bucket.received > bucket.total) bucket.total = bucket.received;
+            // Zero means unknown; received bytes alone never establish completion.
+            bucket.total = reportedTotal ? Math.max(reportedTotal, bucket.received) : 0;
 
             const percent = downloadOverallPercent();
             if (state.stage === 'download') setLinearProgress(percent * DOWNLOAD_WEIGHT * 100);
@@ -834,6 +822,7 @@
     /** Offscreen confirmed a restart. reset=true means it began again from byte 0. */
     function markRestarted(reset = false) {
         state.lastProgressAt = Date.now();
+        state.sourcesReady = false;
         state.note = '';
         if (reset) {
             state.video = { received: 0, total: state.video.total, lastMsgReceived: 0 };
