@@ -141,3 +141,27 @@ test('an interrupted response is never handed to the MP4 processor', {timeout:30
     assert.equal(h.disks.get('video').closed,true);
     assert.equal(h.removed,true);
 });
+
+test('player UMP URLs are normalized to raw tracks before network requests', {timeout:3000}, async () => {
+    const bytes=Buffer.from('a raw media track');
+    const h=harness({job:{mediaUrl:'https://example.com/video?ump=1&range=3-9&sig=a%2fb%20c+z',mediaBytes:bytes.length},fetch:async (url,options) => {
+        assert.equal(new URL(url).searchParams.has('ump'),false);
+        assert.ok(url.includes('sig=a%2fb%20c+z'),'signed query encoding must survive normalization');
+        const match=/bytes=(\d+)-(\d+)/.exec(options.headers.Range);
+        const start=Number(match[1]),end=Number(match[2]);
+        return new Response(bytes.subarray(start,end+1),{status:206,headers:{'content-range':`bytes ${start}-${end}/${bytes.length}`,'content-type':'video/mp4'}});
+    }});
+    const result=await h.start();
+    assert.equal(result.type,'saved');
+    assert.deepEqual(Buffer.from(await result.video.arrayBuffer()),bytes);
+});
+
+test('unexpected player transport is rejected before writing or merging it', {timeout:3000}, async () => {
+    const h=harness({fetch:async () => new Response('player transport',{headers:{'content-type':'application/vnd.yt-ump'}})});
+    const result=await h.start();
+    assert.equal(result.type,'videoStageError');
+    assert.match(result.message,/player transport/);
+    assert.equal(h.disks.get('video').bytes.length,0);
+    assert.equal(h.disks.get('video').closed,true);
+    assert.equal(h.removed,true);
+});

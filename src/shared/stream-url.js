@@ -1,6 +1,6 @@
 /* Shared by the service worker and offscreen downloader. Keep signed URL bytes intact. */
 (() => {
-    function withoutRange(url) {
+    function withoutParameters(url, names) {
         if (!url) return url;
         const value = String(url);
         const hashIndex = value.indexOf('#');
@@ -9,10 +9,14 @@
         const queryIndex = resource.indexOf('?');
         if (queryIndex < 0) return value;
         const params = resource.slice(queryIndex + 1).split('&');
-        const kept = params.filter(param => !/^range(?:=|$)/i.test(param));
+        const kept = params.filter(param => !names.includes(param.split('=', 1)[0].toLowerCase()));
         if (kept.length === params.length) return value;
         return resource.slice(0, queryIndex) + (kept.length ? '?' + kept.join('&') : '') + fragment;
     }
+
+    const withoutRange = url => withoutParameters(url, ['range']);
+    // UMP is the player's multiplexed transport, not a raw MP4 track.
+    const forDownload = url => withoutParameters(url, ['range', 'ump']);
 
     function withRange(url, start, end) {
         const value = withoutRange(url);
@@ -23,5 +27,5 @@
         return `${resource}${separator}range=${start}-${end}${fragment}`;
     }
 
-    globalThis.GDriveStreamURL = Object.freeze({ withoutRange, withRange });
+    globalThis.GDriveStreamURL = Object.freeze({ withoutRange, withRange, forDownload });
 })();

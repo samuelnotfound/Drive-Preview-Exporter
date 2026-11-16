@@ -62,13 +62,21 @@
         });
     }
 
-    const { withoutRange: cleanStageURL, withRange: makeRangeQueryURL } = GDriveStreamURL;
+    const { forDownload: cleanStageURL, withRange: makeRangeQueryURL } = GDriveStreamURL;
 
     /** "bytes 0-4194303/24589214" → { start, end, total } (total 0 when "*"). */
     function parseContentRange(value) {
         const m = /bytes\s+(\d+)-(\d+)\/(\d+|\*)/i.exec(String(value || ''));
         if (!m) return null;
         return { start: Number(m[1]), end: Number(m[2]), total: m[3] === '*' ? 0 : Number(m[3]) };
+    }
+
+    function requireRawMedia(response) {
+        if (!/^application\/vnd\.yt-ump(?:;|$)/i.test(response.headers.get('content-type') || '')) return;
+        try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+        throw Object.assign(new Error('Drive returned player transport data instead of a media file. Refresh Drive and retry.'), {
+            name: 'MediaTransportError'
+        });
     }
 
     function rangeUnsupported(message) {
@@ -160,6 +168,7 @@
                     headers: probe.headers
                 });
                 ctx.markProgress();
+                requireRawMedia(response);
                 const range = parseContentRange(response.headers.get('content-range'));
                 const length = Number(response.headers.get('content-length')) || 0;
                 if (response.status === 206 && range?.start === 0 && range.end === 0) {
@@ -188,7 +197,7 @@
                 }
                 try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
             } catch (err) {
-                if (ctx.signal.aborted || err?.name === 'AbortError') throw err;
+                if (ctx.signal.aborted || err?.name === 'AbortError' || err?.name === 'MediaTransportError') throw err;
             }
         }
         return { total, mode: null };
@@ -219,6 +228,7 @@
                     headers: attempt.headers
                 });
                 ctx.markProgress();
+                requireRawMedia(response);
 
                 if (!response.ok && response.status !== 206) {
                     lastError = new Error(`${label} download failed (${response.status})`);
@@ -271,7 +281,7 @@
                 return { data: body, total: range?.total || 0, whole: false };
             } catch (err) {
                 if (err?.name === 'AbortError') throw err;
-                if (err?.name === 'RangeUnsupportedError') throw err;
+                if (err?.name === 'RangeUnsupportedError' || err?.name === 'MediaTransportError') throw err;
                 lastError = err;
             } finally {
                 // Clear the current attempt's in-flight bytes on failure or
@@ -288,7 +298,7 @@
             try {
                 return await fetchRange(baseUrl, start, end, ctx, label);
             } catch (err) {
-                if (err?.name === 'AbortError' || err?.name === 'RangeUnsupportedError'
+                if (err?.name === 'AbortError' || err?.name === 'RangeUnsupportedError' || err?.name === 'MediaTransportError'
                     || cancelledJobs.has(ctx.jobId)) throw err;
                 lastError = err;
                 if (i + 1 < CHUNK_RETRIES) {
@@ -307,6 +317,7 @@
         const response = await fetch(baseUrl, {
             credentials: 'include', cache: 'no-store', signal: ctx.signal
         });
+        requireRawMedia(response);
         if (!response.ok) throw new Error(`${label} download failed (${response.status})`);
         const declared = Number(response.headers.get('content-length')) || 0;
         const reader = response.body?.getReader?.();

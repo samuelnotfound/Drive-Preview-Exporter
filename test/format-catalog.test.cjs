@@ -32,3 +32,6 @@ test('range requests preserve signed query encoding and replace old ranges', () 
     assert.equal(context.GDriveStreamURL.withRange(base+'&range=0-1#player',2,41),base+'&range=2-41#player');
     assert.equal(context.GDriveStreamURL.withRange('https://example.com/video#player',0,1),'https://example.com/video?range=0-1#player');
 });
+test('download normalization removes only range and UMP player flags', () => {
+    assert.equal(context.GDriveStreamURL.forDownload('https://example.com/v?range=0-1&sig=a%20b&UMP=1&srfvp=1&clen=42#player'),'https://example.com/v?sig=a%20b&srfvp=1&clen=42#player');
+});
