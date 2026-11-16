@@ -74,23 +74,6 @@ For other unexpected problems, refreshing the current tab usually resolves them.
 
 This is an experimental program and, like many experimental projects, it may still contain bugs and unexpected behavior. This application is provided as-is.
 
-## Development
-
-Use Node.js 20 or newer. No dependency installation or build step is required:
-
-```sh
-npm run check
-npm test
-```
-
-Load the repository root as an unpacked extension. After editing, reload the extension
-at `chrome://extensions` and refresh the Drive tab so its content scripts update.
-The automated tests cover signed stream URLs, complete downloads, MP4 validation,
-range fallback, cancellation cleanup, and stale progress messages. MP4 tracks must
-contain media data and pass size and duration checks before merging starts. To verify an actual Drive export, open a video you can
-view, choose Export and a quality, and wait for Chrome to finish saving the MP4.
-Check that the saved file plays with both video and audio.
-
 ## Limitations
 
 - PDF quality depends on the resolution Google Drive renders in the viewer.
