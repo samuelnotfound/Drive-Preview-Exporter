@@ -1,5 +1,6 @@
 // Service-worker dependencies load in order, sharing one worker scope.
 importScripts(
+    'shared/stream-url.js',
     'background/config.js',
     'background/runtime.js',
     'background/network-capture.js',

@@ -62,28 +62,7 @@
         });
     }
 
-    /** Remove existing range param so we control ranges ourselves. */
-    function cleanStageURL(url) {
-        if (!url) return url;
-        try {
-            const parsed = new URL(url);
-            parsed.searchParams.delete('range');
-            return parsed.toString();
-        } catch (_) {
-            return url;
-        }
-    }
-
-    function makeRangeQueryURL(url, start, end) {
-        try {
-            const parsed = new URL(url);
-            parsed.searchParams.delete('range');
-            parsed.searchParams.set('range', `${start}-${end}`);
-            return parsed.toString();
-        } catch (_) {
-            return url;
-        }
-    }
+    const { withoutRange: cleanStageURL, withRange: makeRangeQueryURL } = GDriveStreamURL;
 
     /** "bytes 0-4194303/24589214" → { start, end, total } (total 0 when "*"). */
     function parseContentRange(value) {
@@ -636,53 +615,58 @@
         const report = makeReporter(jobId, label, st);
         let autoRestarts = 0;
 
-        for (;;) {
-            throwIfCancelled(jobId);
-            const attempt = beginAttempt(parentSignal, rt);
-            try {
-                await pullStream(st, baseUrl, label, {
-                    jobId,
-                    signal: attempt.signal,
-                    report,
-                    markProgress: attempt.markProgress
-                });
-
-                if (st.bytes !== st.total || st.bytes <= 0) {
-                    throw new Error(`${label} download incomplete (${st.bytes} of ${st.total} bytes)`);
-                }
-                const blob = await st.disk.finish();
-                if (blob.size !== st.bytes) throw new Error(`${label} temporary file was incomplete.`);
-                report(0, true);
-                return { blob, bytes: st.bytes, total: st.total };
-            } catch (err) {
-                if (cancelledJobs.has(jobId)) throw abortError();
-
-                if (attempt.manual) {
-                    postStageMessage('videoStageStatus', {
-                        jobId, stage: 'download', message: `Restarting ${label} download…`
+        try {
+            for (;;) {
+                throwIfCancelled(jobId);
+                if (parentSignal.aborted) throw abortError();
+                const attempt = beginAttempt(parentSignal, rt);
+                try {
+                    await pullStream(st, baseUrl, label, {
+                        jobId,
+                        signal: attempt.signal,
+                        report,
+                        markProgress: attempt.markProgress
                     });
-                    continue;
-                }
-                if (attempt.stuck) {
-                    if (autoRestarts < MAX_STUCK_RESTARTS) {
-                        autoRestarts++;
+
+                    if (st.bytes !== st.total || st.bytes <= 0) {
+                        throw new Error(`${label} download incomplete (${st.bytes} of ${st.total} bytes)`);
+                    }
+                    const blob = await st.disk.finish();
+                    if (blob.size !== st.bytes) throw new Error(`${label} temporary file was incomplete.`);
+                    report(0, true);
+                    return { blob, bytes: st.bytes, total: st.total };
+                } catch (err) {
+                    if (cancelledJobs.has(jobId) || parentSignal.aborted) throw abortError();
+
+                    if (attempt.manual) {
                         postStageMessage('videoStageStatus', {
                             jobId, stage: 'download', message: `Restarting ${label} download…`
                         });
                         continue;
                     }
-                    postStageMessage('videoStageStatus', {
-                        jobId, stage: 'download', message: `${label} download stalled. Waiting for restart…`
-                    });
-                    await waitForManualRestart(rt, parentSignal);
-                    autoRestarts = 0;
-                    continue;
+                    if (attempt.stuck) {
+                        if (autoRestarts < MAX_STUCK_RESTARTS) {
+                            autoRestarts++;
+                            postStageMessage('videoStageStatus', {
+                                jobId, stage: 'download', message: `Restarting ${label} download…`
+                            });
+                            continue;
+                        }
+                        postStageMessage('videoStageStatus', {
+                            jobId, stage: 'download', message: `${label} download stalled. Waiting for restart…`
+                        });
+                        await waitForManualRestart(rt, parentSignal);
+                        autoRestarts = 0;
+                        continue;
+                    }
+                    throw err;
+                } finally {
+                    attempt.dispose();
                 }
-                await st.disk.abort();
-                throw err;
-            } finally {
-                attempt.dispose();
             }
+        } finally {
+            // Close every writer before job cleanup, including cancellation and restart waits.
+            await st.disk.abort();
         }
     }
 
@@ -711,6 +695,7 @@
         jobControllers.set(job.jobId, controller);
         const rt = { attempts: new Set(), waiters: new Set() };
         jobRuntime.set(job.jobId, rt);
+        const streams = [];
 
         try {
             throwIfCancelled(job.jobId);
@@ -722,15 +707,16 @@
                 return { mediaBlob: media.blob, videoBlob: media.blob, audioBlob: null, mediaBlobInfo: media };
             }
 
-            // Both streams must finish (or one must fail) before anything else happens.
-            const [video, audio] = await Promise.all([
+            streams.push(
                 downloadStream(job.videoUrl, job.videoBytes || 0, 'video', job, controller.signal, rt),
                 downloadStream(job.audioUrl, job.audioBytes || 0, 'audio', job, controller.signal, rt)
-            ]);
+            );
+            const [video, audio] = await Promise.all(streams);
             return { videoBlob: video.blob, audioBlob: audio.blob, mediaBlob: null, video, audio };
         } catch (error) {
-            // One stream failed: stop the other instead of letting it keep downloading.
-            try { controller.abort(); } catch (_) {}
+            // Stop the sibling stream and wait for its writer to close before removing files.
+            controller.abort();
+            await Promise.allSettled(streams);
             throw error;
         } finally {
             jobRuntime.delete(job.jobId);

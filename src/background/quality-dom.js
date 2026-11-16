@@ -14,17 +14,6 @@
 /**
  * Injection function executed directly in the content script context of a target frame.
  *
- * HOW IT WORKS:
- * 1. Checks if `window.__driveQualityActions` was exposed by the content script.
- * 2. If the action method exists, invokes it with the supplied arguments.
- * 3. Wraps the return value in a Promise and returns `{ found: true, value }`.
- * 4. Catches errors and returns `{ found: true, error: message }`.
- *
- * NOTE ON SERIALIZATION:
- * Chrome's `scripting.executeScript` automatically awaits returned Promises
- * before sending the result back to the background worker. The return value
- * must be JSON-cloneable.
- *
  * @param {string} actionName - The method name to execute on window.__driveQualityActions
  * @param {Array<*>} actionArgs - Arguments to spread into the action function
  * @returns {Promise<{found: boolean, value?: *, error?: string}>|{found: boolean}}
@@ -109,14 +98,6 @@ async function getTargetFrameIds(tabId, frameId) {
 
 /**
  * Executes a quality automation DOM action across one or all frames in a tab.
- *
- * COMPLICATION & CAN BE WRITTEN IN A BETTER WAY:
- * Notice the ternary argument builder below (lines 118-124). It contains references
- * to `'enableMuteGuard'` and `'releaseMuteGuard'`, which are legacy actions that were
- * removed from the codebase in recent refactorings.
- * Better way: Use a Set or simple lookup dictionary for zero-argument actions:
- *   const NO_ARG_ACTIONS = new Set(['closeMenu', 'revealControls', 'scanQualities', 'resumePlayback']);
- *   const finalArgs = NO_ARG_ACTIONS.has(action) ? [] : [params];
  *
  * @param {number} tabId - Target tab ID
  * @param {string} action - Method name to call

@@ -1,0 +1,13 @@
+{
+  "name": "drive-preview-exporter",
+  "version": "1.9.59",
+  "private": true,
+  "description": "Developer checks for the unpacked Chrome extension.",
+  "scripts": {
+    "test": "node --test",
+    "check": "node scripts/check.cjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

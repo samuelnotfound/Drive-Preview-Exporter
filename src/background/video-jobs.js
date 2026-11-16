@@ -1,7 +1,7 @@
 // ============================================================================
 // FILE: src/background/video-jobs.js
 // PURPOSE: Resolve selected streams, create a download job, open the offscreen
-//          document, and start sequential 4 MiB range downloads + remux.
+//          document, and start disk-backed stream downloads and MP4 remuxing.
 // ============================================================================
 
 let offscreenLock = Promise.resolve();

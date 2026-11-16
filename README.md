@@ -65,7 +65,23 @@ For files opened through Google Classroom, the **"Export"** menu might work but 
 
 For other unexpected problems, refreshing the current tab usually resolves them.
 
-This is an experimental program and, like many experimental projects, it may still contain bugs and unexpected behavior. The current version was originally developed with AI assistance and contains some messy, overly complicated code. I plan to simplify and clean up the codebase in the future, but until then, this application is being provided as-is.
+This is an experimental program and, like many experimental projects, it may still contain bugs and unexpected behavior. This application is provided as-is.
+
+## Development
+
+Use Node.js 20 or newer. No dependency installation or build step is required:
+
+```sh
+npm run check
+npm test
+```
+
+Load the repository root as an unpacked extension. After editing, reload the extension
+at `chrome://extensions` and refresh the Drive tab so its content scripts update.
+The automated tests cover signed stream URLs, complete downloads, range fallback,
+and cancellation cleanup. To verify an actual Drive export, open a video you can
+view, choose Export and a quality, and wait for Chrome to finish saving the MP4.
+Check that the saved file plays with both video and audio.
 
 ## Limitations
 
