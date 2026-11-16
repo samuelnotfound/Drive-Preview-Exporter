@@ -5,7 +5,8 @@
   "description": "Developer checks for the unpacked Chrome extension.",
   "scripts": {
     "test": "node --test",
-    "check": "node scripts/check.cjs"
+    "check": "node scripts/check.cjs && node scripts/build-bookmarklet.cjs --check",
+    "build:bookmarklet": "node scripts/build-bookmarklet.cjs"
   },
   "engines": {
     "node": ">=20"

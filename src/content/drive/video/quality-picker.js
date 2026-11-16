@@ -270,7 +270,7 @@
                     <input type="hidden" id="psd-video-quality-video" value="" />
                 </div>
                 <div id="psd-video-quality-actions">
-                    <button id="psd-video-quality-download" type="button">Export</button>
+                    <button id="psd-video-quality-download" type="button">Download</button>
                 </div>
             </div>
             <div id="psd-video-quality-status"></div>
