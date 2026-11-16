@@ -182,6 +182,13 @@
 
     function resetVideoContextForFileChange() {
         app.videoQuality?.stopWatch?.();
+        if (video.captureTabId) {
+            void sendRuntime({
+                action: 'releaseBackgroundCaptureTab',
+                captureTabId: video.captureTabId
+            });
+            video.captureTabId = 0;
+        }
         video.playbackStarted = false;
         video.restorePickerOnFileMenuOpen = false;
         video.formats = cloneFormats({});

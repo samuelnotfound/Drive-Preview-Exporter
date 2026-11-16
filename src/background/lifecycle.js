@@ -212,6 +212,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     // If the URL changed, evaluate whether we should clear media session state
     if (changeInfo?.url) {
         if (shouldClearSessionForNavigation(previousUrl, changeInfo.url)) {
+            void releaseBackgroundCaptureForTab(tabId);
             clearTabMediaState(tabId, { clearGlobal: true, fileId });
         }
         return;

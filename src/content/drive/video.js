@@ -69,7 +69,7 @@
         } else if (video.operation === 'scanning') {
             labelText = 'Reading qualities…';
         } else if (!ready) {
-            infoText = 'Scans qualities and starts a muted preview automatically.';
+            infoText = 'Scans qualities and captures streams in a muted background tab.';
         }
 
         document.querySelectorAll('#' + VIDEO_MENU_ID).forEach(item => {
@@ -260,7 +260,7 @@
         } catch (_) { return false; }
     }
 
-    /** Download is allowed only when a real playback signal exists. */
+    /** Whether the visible Drive tab itself has playback or recent stream activity. */
     function isPlaybackReadyForDownload() {
         if (isDriveVideoPlayingNow()) return true;
         // Network recently saw videoplayback for this tab (set by videoStreamDetected).
@@ -268,17 +268,6 @@
             return true;
         }
         return false;
-    }
-
-    function optionsFromPlaybackApi() {
-        const heights = Array.isArray(video.playbackQualityHeights) ? video.playbackQualityHeights : [];
-        if (!heights.length) return [];
-        return heights.map(h => ({
-            height: Number(h) || 0,
-            label: `${Number(h)}p`,
-            selected: false,
-            source: 'playback-api'
-        })).filter(o => o.height);
     }
 
     function applyQualityOptions(options, note) {
@@ -322,33 +311,23 @@
             const context = await core.syncViewerContext(true);
             if (!context?.fileId) throw new Error('Could not identify the current Drive video.');
 
-            const playback = await core.sendRuntime({ action: 'prepareVideoPlayback' });
-            if (!playback?.ok) throw new Error(playback?.error || 'Could not start the muted Drive preview.');
+            const playback = await core.sendRuntime({
+                action: 'prepareVideoPlayback',
+                fileId: video.fileId,
+                captureTabId: video.captureTabId
+            });
+            if (!playback?.ok) throw new Error(playback?.error || 'Could not start background playback.');
             previewPrepared = true;
+            video.captureTabId = Number(playback.captureTabId) || video.captureTabId || 0;
             video.playbackStarted = true;
 
-            // 1) Prefer heights from the intercepted /playback API (prototype approach).
-            //    Available as soon as the video has played; no Settings→Quality DOM needed.
-            const fromApi = optionsFromPlaybackApi();
-            if (fromApi.length) {
-                const formats = applyQualityOptions(
-                    fromApi,
-                    `Found ${fromApi.length} quality option(s) from player. Select one, then Export.`
-                );
-                await quality.show(
-                    formats,
-                    `Found ${fromApi.length} quality option(s). Starting export at the remembered or highest quality…`,
-                    fromApi
-                );
-                await quality.download();
-                return;
-            }
-
-            // 2) Fallback: open Settings → Quality and scan menu labels.
+            // Scan the inactive background Drive player's own quality menu.
             const response = await core.sendRuntime({
                 action: 'listPlayerQualityLabels',
-                fileId: video.fileId
+                fileId: video.fileId,
+                captureTabId: video.captureTabId
             });
+            if (response?.captureTabId) video.captureTabId = Number(response.captureTabId);
 
             const options = Array.isArray(response?.options) ? response.options : [];
             if (response?.success && options.length) {
@@ -386,7 +365,13 @@
             } catch (_) {}
         } finally {
             if (previewPrepared) {
-                try { await core.sendRuntime({ action: 'restoreVideoPlayback' }); } catch (_) {}
+                try {
+                    await core.sendRuntime({
+                        action: 'restoreVideoPlayback',
+                        fileId: video.fileId,
+                        captureTabId: video.captureTabId
+                    });
+                } catch (_) {}
             }
         }
 
@@ -588,6 +573,13 @@
         video.viewerSessionId = '';
         video.lastSelectedHeight = 0;
         video.lastSelectedQuality = '';
+        if (video.captureTabId) {
+            void core.sendRuntime({
+                action: 'releaseBackgroundCaptureTab',
+                captureTabId: video.captureTabId
+            });
+            video.captureTabId = 0;
+        }
         video.formats = core.cloneFormats({});
         void quality.clearSnapshot(previousFileId);
     }
@@ -797,6 +789,7 @@
 
     function finishVideoStage(stage, message) {
         videoOverlay.clearJob();
+        video.captureTabId = 0;
         releaseStagingLock();
         videoOverlay.update({ stage, ...(message ? { message } : {}) });
     }

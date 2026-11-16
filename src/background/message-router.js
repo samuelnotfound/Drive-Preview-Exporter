@@ -15,23 +15,33 @@ const invalidTabResponse = () => ({ success: false, error: 'Invalid Drive tab.' 
 /** Standardized response factory when a Drive file changes mid-operation */
 const sessionChangedResponse = () => ({ success: false, error: 'The current Drive video session changed.' });
 
-async function handlePrepareVideoPlayback({ tabId }) {
+async function handlePrepareVideoPlayback({ request, tabId }) {
+    const sourceSession = await getStoredSession(tabId);
+    const fileId = String(request.fileId || sourceSession?.fileId || '').trim();
+    if (!fileId) return { ok: false, error: 'Could not identify the current Drive video.' };
     try {
         // Start the hidden HTML loader on Export click so it is ready to check
         // stream URLs as soon as the Drive player exposes them.
         await ensureVideoOffscreen();
+        const captureTabId = await ensureBackgroundCaptureTab(tabId, fileId, request.captureTabId);
+        return { ok: true, captureTabId };
     } catch (error) {
-        return { ok: false, error: `Could not start the background media checker: ${error?.message || String(error)}` };
+        const entry = await readBackgroundCaptureEntry(tabId);
+        if (entry) await closeBackgroundCaptureTab(tabId, entry.captureTabId);
+        setTimeout(() => { void closeVideoOffscreen(); }, 1200);
+        return { ok: false, error: `Could not start background playback: ${error?.message || String(error)}` };
     }
-    const rows = await runQualityDom(tabId, 'prepareMutedPlayback');
-    return rows.find(row => row?.value?.ok)?.value
-        || rows.find(row => row?.value?.error)?.value
-        || { ok: false, error: 'Could not find the Drive video player.' };
 }
 
-async function handleRestoreVideoPlayback({ tabId }) {
-    await runQualityDom(tabId, 'restorePlayback');
+async function handleRestoreVideoPlayback({ request, tabId }) {
+    const captureTabId = Number(request.captureTabId) || Number((await readBackgroundCaptureEntry(tabId))?.captureTabId) || 0;
+    if (captureTabId) await runQualityDom(captureTabId, 'restorePlayback');
     setTimeout(() => { void closeVideoOffscreen(); }, 1200);
+    return { success: true };
+}
+
+async function handleReleaseBackgroundCaptureTab({ request, tabId }) {
+    await closeBackgroundCaptureTab(tabId, request.captureTabId);
     return { success: true };
 }
 
@@ -356,13 +366,20 @@ async function handlePageStreamDetected({ request, tabId }) {
  * Opens the Drive video player's Settings -> Quality menu and reads all available resolution options.
  */
 async function handleListPlayerQualityLabels({ request, tabId }) {
-    const existing = QUALITY_SCAN_TAB_LOCK.get(tabId);
+    let captureTabId;
+    try {
+        captureTabId = await ensureBackgroundCaptureTab(tabId, request.fileId, request.captureTabId);
+    } catch (error) {
+        return { success: false, error: error?.message || 'Could not start background playback.', options: [] };
+    }
+
+    const existing = QUALITY_SCAN_TAB_LOCK.get(captureTabId);
     if (existing?.promise) {
-        return { success: false, error: 'Another quality operation is already running on this tab.', options: [] };
+        return { success: false, error: 'Another quality operation is already running on this tab.', options: [], captureTabId };
     }
 
     const work = (async () => {
-        const found = await getSessionForFile(tabId, request.fileId);
+        const found = await getSessionForFile(captureTabId, request.fileId);
         const fileId = String(found?.fileId || request.fileId || '').trim();
 
         // Localized string variants for Settings and Quality buttons
@@ -374,12 +391,12 @@ async function handleListPlayerQualityLabels({ request, tabId }) {
             let lastError = '';
 
             for (let attempt = 0; attempt < 2 && !options.length; attempt++) {
-                await closePlayerMenu(tabId);
+                await closePlayerMenu(captureTabId);
                 await sleep(150 + attempt * 100);
-                try { await runQualityDom(tabId, 'revealControls'); } catch (_) {}
+                try { await runQualityDom(captureTabId, 'revealControls'); } catch (_) {}
 
                 // Open Settings menu
-                const settings = await clickMenuLikeMini(tabId, SETTINGS, 'Settings', 5000, true);
+                const settings = await clickMenuLikeMini(captureTabId, SETTINGS, 'Settings', 5000, true);
                 if (!settings?.ok) {
                     lastError = settings?.reason || 'Could not open Settings.';
                     continue;
@@ -388,7 +405,7 @@ async function handleListPlayerQualityLabels({ request, tabId }) {
 
                 // Open Quality submenu
                 const quality = await clickMenuLikeMini(
-                    tabId, QUALITY, 'Quality', 5000, false,
+                    captureTabId, QUALITY, 'Quality', 5000, false,
                     Number.isInteger(settings.frameId) ? settings.frameId : null
                 );
                 if (!quality?.ok) {
@@ -400,7 +417,7 @@ async function handleListPlayerQualityLabels({ request, tabId }) {
                 // Scan quality options while submenu is visible
                 const deadline = Date.now() + 4000;
                 while (Date.now() < deadline) {
-                    const rows = await runQualityDom(tabId, 'scanQualities');
+                    const rows = await runQualityDom(captureTabId, 'scanQualities');
                     const byHeight = new Map();
                     for (const row of rows || []) {
                         const value = row?.value;
@@ -431,23 +448,25 @@ async function handleListPlayerQualityLabels({ request, tabId }) {
                     await sleep(120);
                 }
 
-                await closePlayerMenu(tabId);
+                await closePlayerMenu(captureTabId);
                 if (options.length) break;
                 lastError = lastError || 'No quality options were found in the menu.';
             }
 
             if (!options.length) {
-                try { await closePlayerMenu(tabId); } catch (_) {}
+                try { await closePlayerMenu(captureTabId); } catch (_) {}
                 return {
                     success: false,
                     error: lastError || 'No quality options were found in the menu.',
-                    options: []
+                    options: [],
+                    captureTabId
                 };
             }
 
             return {
                 success: true,
                 fileId,
+                captureTabId,
                 options,
                 formats: {
                     video: options.map(o => ({
@@ -464,16 +483,16 @@ async function handleListPlayerQualityLabels({ request, tabId }) {
                 }
             };
         } catch (error) {
-            return { success: false, error: error?.message || 'Failed to list quality labels.', options: [] };
+            return { success: false, error: error?.message || 'Failed to list quality labels.', options: [], captureTabId };
         }
     })();
 
     // Store in lock Map
-    QUALITY_SCAN_TAB_LOCK.set(tabId, { promise: work, finishedAt: 0 });
+    QUALITY_SCAN_TAB_LOCK.set(captureTabId, { promise: work, finishedAt: 0 });
     try {
         return await work;
     } finally {
-        QUALITY_SCAN_TAB_LOCK.set(tabId, { promise: null, finishedAt: Date.now() });
+        QUALITY_SCAN_TAB_LOCK.set(captureTabId, { promise: null, finishedAt: Date.now() });
     }
 }
 
@@ -491,55 +510,59 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
     const height = Number(request.qualityHeight || request.height || 0);
     const label = String(request.qualityLabel || request.label || (height ? `${height}p` : '')).trim();
     if (!height) return { success: false, error: 'No quality selected.' };
-    const found = await getSessionForFile(tabId, request.fileId);
+    let captureTabId;
+    try { captureTabId = await ensureBackgroundCaptureTab(tabId, request.fileId, request.captureTabId); }
+    catch (error) { return { success: false, error: error?.message || 'Could not start background playback.' }; }
+
+    const found = await getSessionForFile(captureTabId, request.fileId);
     if (!found) return sessionChangedResponse();
     const { fileId } = found;
     const viewerSessionId = found.session.viewerSessionId || '';
     const isCurrentSession = session => session && session.fileId === fileId &&
         String(session.viewerSessionId || '') === viewerSessionId;
-    if (QUALITY_SCAN_TAB_LOCK.get(tabId)?.promise) {
-        return { success: false, error: 'Another quality capture is already running.' };
+    if (QUALITY_SCAN_TAB_LOCK.get(captureTabId)?.promise) {
+        return { success: false, error: 'Another quality capture is already running.', captureTabId };
     }
 
     const work = (async () => {
         let probe;
         try {
-            await closePlayerMenu(tabId);
+            await closePlayerMenu(captureTabId);
             await sleep(120);
-            try { await runQualityDom(tabId, 'revealControls'); } catch (_) {}
+            try { await runQualityDom(captureTabId, 'revealControls'); } catch (_) {}
             await sleep(100);
-            if (!isCurrentSession(await getStoredSession(tabId))) return sessionChangedResponse();
+            if (!isCurrentSession(await getStoredSession(captureTabId))) return sessionChangedResponse();
 
             // Install the probe before clicking: the player can request the new
             // resolution immediately, while the click animation is still running.
-            probe = await beginQualityProbe(tabId, fileId, label || `${height}p`);
+            probe = await beginQualityProbe(captureTabId, fileId, label || `${height}p`);
             if (!probe || probe.accepted === false) return sessionChangedResponse();
             const clickAt = Date.now();
-            const selected = await selectQualityVerified(tabId, label || `${height}p`, height, 8000, null);
+            const selected = await selectQualityVerified(captureTabId, label || `${height}p`, height, 8000, null);
             if (!selected?.ok) return { success: false, error: `Could not find ${label || height + 'p'} in the quality menu.` };
-            const playback = await runQualityDom(tabId, 'prepareMutedPlayback');
+            const playback = await runQualityDom(captureTabId, 'prepareMutedPlayback');
             if (!playback.some(row => row?.value?.ok)) {
                 return { success: false, error: playback.find(row => row?.value?.error)?.value?.error || 'Could not start the muted preview.' };
             }
-            try { await nudgePlaybackAfterQualitySwitch(tabId); } catch (_) {}
+            try { await nudgePlaybackAfterQualitySwitch(captureTabId); } catch (_) {}
 
-            let video = await waitForQualityStream(tabId, probe.token, height, 6000, new Set(), clickAt);
+            let video = await waitForQualityStream(captureTabId, probe.token, height, 6000, new Set(), clickAt);
             if (!video?.url) {
-                try { await nudgePlaybackAfterQualitySwitch(tabId); } catch (_) {}
-                video = await waitForQualityStream(tabId, probe.token, height, 4000, new Set(), clickAt);
+                try { await nudgePlaybackAfterQualitySwitch(captureTabId); } catch (_) {}
+                video = await waitForQualityStream(captureTabId, probe.token, height, 4000, new Set(), clickAt);
             }
             // Re-selecting an already buffered quality may not make a new request.
             // Only independently identified, matching cached streams are eligible.
             if (!forceFresh && !video?.url) {
-                video = (streamCaptureState(tabId)?.recentStreams || [])
+                video = (streamCaptureState(captureTabId)?.recentStreams || [])
                     .filter(stream => matchesQualityStream(stream, height))
                     .sort((a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0))[0] || null;
             }
             if (!video?.url) return {
                 success: false,
-                error: `${label || height + 'p'} did not produce a matching video stream. Play or seek the video, then try Download again.`
+                error: `${label || height + 'p'} did not produce a matching stream in the background player. Try Export again.`
             };
-            if (!isCurrentSession(await getStoredSession(tabId))) return sessionChangedResponse();
+            if (!isCurrentSession(await getStoredSession(captureTabId))) return sessionChangedResponse();
             video = {
                 ...video, height, qualityHeight: height, probeQuality: label,
                 url: cleanURL(video.originalUrl || video.url) || video.url,
@@ -548,17 +571,17 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
 
             // Changing video resolution often reuses buffered audio. Keep audio
             // scoped to this viewer; a global fallback may belong to another tab.
-            const recentAudio = (streamCaptureState(tabId)?.recentStreams || [])
+            const recentAudio = (streamCaptureState(captureTabId)?.recentStreams || [])
                 .filter(stream => stream?.url && isAudioStream(stream))
                 .sort((a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0));
-            let audio = recentAudio[0] || await getCurrentSessionAudioCandidate(tabId);
+            let audio = recentAudio[0] || await getCurrentSessionAudioCandidate(captureTabId);
             if (audio?.url) audio = {
                 ...audio, url: cleanURL(audio.originalUrl || audio.url) || audio.url,
                 originalUrl: audio.originalUrl || audio.url
             };
 
             let saved = false;
-            await queueSessionMutation(tabId, current => {
+            await queueSessionMutation(captureTabId, current => {
                 if (!isCurrentSession(current)) return false;
                 current.formats = current.formats || { video: [], audio: [], progressive: [] };
                 current.formats.video = mergeFormatLists(current.formats.video || [], [video], byHeightWidthThenSize, 48);
@@ -588,21 +611,21 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
             });
             const preflight = await preflightCapturedStreams(streamsToCheck);
             if (!preflight?.success) {
-                return { success: false, error: `Background media URL check failed: ${preflight?.error || 'the stream is not available.'}` };
+                return { success: false, error: `Background media URL check failed: ${preflight?.error || 'the stream is not available.'}`, captureTabId };
             }
 
-            return { success: true, video, audio: audio?.url ? audio : null, height, label };
+            return { success: true, video, audio: audio?.url ? audio : null, height, label, captureTabId };
         } finally {
-            if (probe?.token) try { await endQualityProbe(tabId, probe.token); } catch (_) {}
-            try { await closePlayerMenu(tabId); } catch (_) {}
-            try { await runQualityDom(tabId, 'restorePlayback'); } catch (_) {}
+            if (probe?.token) try { await endQualityProbe(captureTabId, probe.token); } catch (_) {}
+            try { await closePlayerMenu(captureTabId); } catch (_) {}
+            try { await runQualityDom(captureTabId, 'restorePlayback'); } catch (_) {}
         }
     })();
-    QUALITY_SCAN_TAB_LOCK.set(tabId, { promise: work, finishedAt: 0 });
+    QUALITY_SCAN_TAB_LOCK.set(captureTabId, { promise: work, finishedAt: 0 });
     try { return await work; }
     finally {
-        if (QUALITY_SCAN_TAB_LOCK.get(tabId)?.promise === work) {
-            QUALITY_SCAN_TAB_LOCK.set(tabId, { promise: null, finishedAt: Date.now() });
+        if (QUALITY_SCAN_TAB_LOCK.get(captureTabId)?.promise === work) {
+            QUALITY_SCAN_TAB_LOCK.set(captureTabId, { promise: null, finishedAt: Date.now() });
         }
     }
 }
@@ -804,6 +827,7 @@ async function handleActivateVideoStage({ request, tabId }) {
         throw error;
     } catch (error) {
         await removeVideoStageJob(jobId);
+    if (job) await closeBackgroundCaptureTab(job.sourceTabId, job.captureTabId);
         return { success: false, error: error?.message || String(error) };
     }
 }
@@ -898,6 +922,7 @@ async function cancelVideoStage(jobId, job, options = {}) {
         await sendTab(job.sourceTabId, { type: 'videoStageCancelled', jobId });
     }
     await removeVideoStageJob(jobId);
+    if (job?.captureTabId) await closeBackgroundCaptureTab(job.sourceTabId, job.captureTabId);
     // Schedule check to close offscreen document
     setTimeout(closeVideoOffscreen, 100);
     return { success: true };
@@ -946,6 +971,7 @@ async function handleVideoStageMessage({ request }) {
             delete currentJobs[request.jobId];
             return true;
         });
+        if (job?.captureTabId) await closeBackgroundCaptureTab(job.sourceTabId, job.captureTabId);
         setTimeout(closeVideoOffscreen, 1200);
     }
     return { success: true };
@@ -975,6 +1001,7 @@ const ACTION_HANDLERS = Object.freeze({
     listPlayerQualityLabels: requireDriveTab(handleListPlayerQualityLabels),
     prepareVideoPlayback: requireDriveTab(handlePrepareVideoPlayback),
     restoreVideoPlayback: requireDriveTab(handleRestoreVideoPlayback),
+    releaseBackgroundCaptureTab: requireDriveTab(handleReleaseBackgroundCaptureTab),
     captureQualityForDownload: requireDriveTab(handleCaptureQualityForDownload),
     clearTabCaptureState: requireDriveTab(handleClearTabCaptureState),
     getStreams: handleGetStreams,

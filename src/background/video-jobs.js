@@ -6,6 +6,149 @@
 
 let offscreenLock = Promise.resolve();
 let offscreenGeneration = 0;
+const BACKGROUND_CAPTURE_STORAGE_KEY = 'psdBackgroundCaptureTabs';
+const BACKGROUND_CAPTURE_TABS = new Map();
+
+async function readBackgroundCaptureEntry(sourceTabId) {
+    const key = String(sourceTabId);
+    if (BACKGROUND_CAPTURE_TABS.has(key)) return BACKGROUND_CAPTURE_TABS.get(key);
+    try {
+        const saved = await chrome.storage.session.get(BACKGROUND_CAPTURE_STORAGE_KEY);
+        const entry = saved?.[BACKGROUND_CAPTURE_STORAGE_KEY]?.[key] || null;
+        if (entry) BACKGROUND_CAPTURE_TABS.set(key, entry);
+        return entry;
+    } catch (_) { return null; }
+}
+
+async function writeBackgroundCaptureEntry(sourceTabId, entry) {
+    const key = String(sourceTabId);
+    BACKGROUND_CAPTURE_TABS.set(key, entry);
+    try {
+        const saved = await chrome.storage.session.get(BACKGROUND_CAPTURE_STORAGE_KEY);
+        const entries = saved?.[BACKGROUND_CAPTURE_STORAGE_KEY] || {};
+        entries[key] = entry;
+        await chrome.storage.session.set({ [BACKGROUND_CAPTURE_STORAGE_KEY]: entries });
+    } catch (_) {}
+}
+
+async function forgetBackgroundCaptureEntry(sourceTabId) {
+    const key = String(sourceTabId);
+    BACKGROUND_CAPTURE_TABS.delete(key);
+    try {
+        const saved = await chrome.storage.session.get(BACKGROUND_CAPTURE_STORAGE_KEY);
+        const entries = saved?.[BACKGROUND_CAPTURE_STORAGE_KEY] || {};
+        delete entries[key];
+        await chrome.storage.session.set({ [BACKGROUND_CAPTURE_STORAGE_KEY]: entries });
+    } catch (_) {}
+}
+
+async function closeBackgroundCaptureTab(sourceTabId, captureTabId = 0) {
+    const entry = Number.isInteger(sourceTabId) ? await readBackgroundCaptureEntry(sourceTabId) : null;
+    const id = Number(captureTabId) || Number(entry?.captureTabId) || 0;
+    if (id > 0) {
+        try {
+            const jobs = await getStoredJobs();
+            if (Object.values(jobs || {}).some(job => Number(job?.captureTabId) === id)) return;
+        } catch (_) {}
+    }
+    if (entry && (!captureTabId || Number(entry.captureTabId) === id)) {
+        await forgetBackgroundCaptureEntry(sourceTabId);
+    }
+    if (id > 0 && id !== Number(sourceTabId)) {
+        try { await chrome.tabs.remove(id); } catch (_) {}
+    }
+}
+
+async function releaseBackgroundCaptureForTab(tabId) {
+    const sourceEntry = await readBackgroundCaptureEntry(tabId);
+    if (sourceEntry) await closeBackgroundCaptureTab(tabId, sourceEntry.captureTabId);
+    else {
+        try {
+            const saved = await chrome.storage.session.get(BACKGROUND_CAPTURE_STORAGE_KEY);
+            const entries = saved?.[BACKGROUND_CAPTURE_STORAGE_KEY] || {};
+            const owner = Object.entries(entries).find(([, entry]) => Number(entry?.captureTabId) === Number(tabId));
+            if (owner) await forgetBackgroundCaptureEntry(Number(owner[0]));
+        } catch (_) {}
+    }
+}
+
+async function waitForBackgroundCaptureTab(tabId, timeoutMs = 20000) {
+    const deadline = Date.now() + timeoutMs;
+    let lastError = '';
+    while (Date.now() < deadline) {
+        let tab;
+        try { tab = await chrome.tabs.get(tabId); }
+        catch (_) { throw new Error('The background Drive tab closed before it finished loading.'); }
+        if (tab.status === 'complete') break;
+        await sleep(200);
+    }
+
+    while (Date.now() < deadline) {
+        const session = await getStoredSession(tabId);
+        if (session?.fileId) return session;
+        await sleep(250);
+    }
+    lastError = 'Drive did not finish opening the background video player.';
+    throw new Error(lastError);
+}
+
+/** Create an inactive Drive tab and start muted playback there for stream capture. */
+async function ensureBackgroundCaptureTab(sourceTabId, fileId, requestedCaptureTabId = 0, startPlayback = true) {
+    const sourceId = Number(sourceTabId);
+    const id = String(fileId || '').trim();
+    if (!Number.isInteger(sourceId) || sourceId < 0) throw new Error('Could not identify the tab that started Export.');
+    if (!/^[A-Za-z0-9_-]{10,}$/.test(id)) throw new Error('Could not identify the current Drive video.');
+
+    let entry = await readBackgroundCaptureEntry(sourceId);
+    let captureTabId = Number(requestedCaptureTabId) || 0;
+    if (!captureTabId && entry?.fileId === id) captureTabId = Number(entry.captureTabId) || 0;
+
+    if (captureTabId) {
+        try {
+            const tab = await chrome.tabs.get(captureTabId);
+            if (!String(tab.url || '').includes(`/file/d/${id}/`)) captureTabId = 0;
+        } catch (_) { captureTabId = 0; }
+    }
+
+    if (!captureTabId) {
+        if (entry?.captureTabId) await closeBackgroundCaptureTab(sourceId, entry.captureTabId);
+        let source = null;
+        try { source = await chrome.tabs.get(sourceId); } catch (_) {}
+        const tab = await chrome.tabs.create({
+            url: `https://drive.google.com/file/d/${encodeURIComponent(id)}/view`,
+            active: false,
+            ...(Number.isInteger(source?.windowId) ? { windowId: source.windowId } : {})
+        });
+        captureTabId = tab.id;
+        entry = { sourceTabId: sourceId, captureTabId, fileId: id };
+        await writeBackgroundCaptureEntry(sourceId, entry);
+    }
+
+    const session = await waitForBackgroundCaptureTab(captureTabId);
+    if (String(session.fileId || '') !== id) {
+        throw new Error('The background Drive tab opened a different video.');
+    }
+    if (!startPlayback) return captureTabId;
+
+    let lastError = '';
+    for (let attempt = 0; attempt < 32; attempt++) {
+        const rows = await runQualityDom(captureTabId, 'prepareMutedPlayback');
+        const result = rows.find(row => row?.value?.ok)?.value
+            || rows.find(row => row?.value?.error)?.value;
+        if (result?.ok) {
+            await writeBackgroundCaptureEntry(sourceId, { sourceTabId: sourceId, captureTabId, fileId: id });
+            return captureTabId;
+        }
+        lastError = result?.error || lastError;
+        if (/blocked muted playback|could not start/i.test(lastError)) break;
+        await sleep(350);
+    }
+    throw new Error(lastError || 'Could not start muted playback in the background Drive tab.');
+}
+
+try {
+    chrome.tabs.onRemoved.addListener(tabId => { void releaseBackgroundCaptureForTab(tabId); });
+} catch (_) {}
 
 /** Open the offscreen document used for chunk download + MP4 remux (MV3 has no DOM in the SW). */
 async function ensureVideoOffscreen() {
@@ -88,12 +231,13 @@ async function closeVideoOffscreen() {
     return run;
 }
 
-async function createVideoStageJob(tabId, session, mode, payload) {
+async function createVideoStageJob(sourceTabId, captureTabId, session, mode, payload) {
     const jobId = `gdrive-video-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     await queueJobMutation(jobs => {
         jobs[jobId] = {
             jobId,
-            sourceTabId: Number.isInteger(tabId) ? tabId : null,
+            sourceTabId: Number.isInteger(sourceTabId) ? sourceTabId : null,
+            captureTabId: Number.isInteger(captureTabId) ? captureTabId : null,
             fileId: session?.fileId || '',
             viewerSessionId: session?.viewerSessionId || '',
             filename: payload.filename,
@@ -292,10 +436,16 @@ function selectFormats(session, request, tabId = null) {
  * 4. Offscreen downloads 4 MiB ranges, remuxes, triggers browser download
  */
 async function startVideoDownload(tabId, request = {}) {
-    const session = await getStoredSession(tabId);
+    const captureTabId = await ensureBackgroundCaptureTab(
+        tabId, request.fileId, request.captureTabId, !Number(request.captureTabId)
+    );
+    const session = await getStoredSession(captureTabId);
     if (!session) return { success: false, error: 'No active Drive video session was found.' };
 
-    const contextError = validateDownloadContext(session, request);
+    const contextError = validateDownloadContext(session, {
+        ...request,
+        viewerSessionId: session.viewerSessionId || ''
+    });
     if (contextError) return { success: false, error: contextError };
 
     // Prefer URLs supplied by the quality picker; fall back to session pools.
@@ -328,7 +478,7 @@ async function startVideoDownload(tabId, request = {}) {
                 }
             };
         } else {
-            const audio = pickBestAudioFromPools(session, tabId);
+            const audio = pickBestAudioFromPools(session, captureTabId);
             if (audio?.url) {
                 selected = {
                     mode: 'adaptive',
@@ -347,18 +497,18 @@ async function startVideoDownload(tabId, request = {}) {
         }
     }
 
-    if (!selected) selected = selectFormats(session, request, tabId);
+    if (!selected) selected = selectFormats(session, request, captureTabId);
 
     if (!selected) {
         return {
             success: false,
-            error: 'No usable video stream was found for this quality. Play the video, pick a quality, then try again.'
+            error: 'No usable video stream was found in the background player. Try Export again.'
         };
     }
     if (selected.missingAudio || (selected.mode === 'adaptive' && !selected.audio?.url)) {
         return {
             success: false,
-            error: 'Video stream is ready but no audio track was captured yet. Play the video for a few seconds, then try Download again.'
+            error: 'The background player did not provide an audio track. Try Export again.'
         };
     }
 
@@ -370,6 +520,7 @@ async function startVideoDownload(tabId, request = {}) {
     try {
         jobId = await createVideoStageJob(
             tabId,
+            captureTabId,
             session,
             selected.mode === 'single' ? 'single' : 'adaptive',
             stagePayload
@@ -396,19 +547,26 @@ function refreshVideoStageStreams({ request }) {
     const work = (async () => {
         const job = (await getStoredJobs())[jobId];
         if (!job || !['single', 'adaptive'].includes(job.mode)) return { success: false, error: 'No active video download.' };
-        const session = await getStoredSession(job.sourceTabId);
-        if (!session || validateDownloadContext(session, job)) return { success: false, error: 'The Drive viewer changed.' };
+        const captureTabId = Number(job.captureTabId) || Number(job.sourceTabId);
+        const session = await getStoredSession(captureTabId);
+        if (!session || validateDownloadContext(session, { fileId: job.fileId, viewerSessionId: session.viewerSessionId })) return { success: false, error: 'The Drive viewer changed.' };
         const height = Number(job.qualityHeight || parseStreamCandidate(job.videoUrl || job.mediaUrl)?.height || 0);
         if (!height) return { success: false, error: 'Could not identify the selected quality.' };
         const capture = await handleCaptureQualityForDownload({
             tabId: job.sourceTabId,
-            request: { fileId: job.fileId, qualityHeight: height, qualityLabel: height + 'p', forceFresh: true }
+            request: {
+                fileId: job.fileId,
+                captureTabId,
+                qualityHeight: height,
+                qualityLabel: height + 'p',
+                forceFresh: true
+            }
         });
         if (!capture?.success || !capture.video?.url || (job.mode === 'adaptive' && !capture.audio?.url)) {
-            return { success: false, error: 'Fresh video and audio streams were not captured. Play the video and try Download again.' };
+            return { success: false, error: 'Fresh video and audio streams were not captured in the background player. Try Export again.' };
         }
-        const current = await getStoredSession(job.sourceTabId);
-        if (!current || validateDownloadContext(current, job)) return { success: false, error: 'The Drive viewer changed.' };
+        const current = await getStoredSession(captureTabId);
+        if (!current || validateDownloadContext(current, { fileId: job.fileId, viewerSessionId: current.viewerSessionId })) return { success: false, error: 'The Drive viewer changed.' };
         const capturedVideo = { ...parseStreamCandidate(capture.video.originalUrl || capture.video.url), ...capture.video };
         if ((job.mode === 'single') !== isMuxedStream(capturedVideo)) {
             return { success: false, error: 'The stream format changed. Choose the quality again.' };

@@ -908,7 +908,8 @@
             progressiveFormatId: resolvedId,
             qualityHeight,
             qualityLabel: label || (qualityHeight ? `${qualityHeight}p` : ''),
-            filename
+            filename,
+            captureTabId: Number(video.captureTabId) || 0
         };
         return request;
     }
@@ -979,11 +980,17 @@
             capture = await core.sendRuntime({
                 action: 'captureQualityForDownload',
                 fileId: video.fileId,
+                captureTabId: Number(video.captureTabId) || Number(request.captureTabId) || 0,
                 qualityHeight: height,
                 qualityLabel: label
             });
         } catch (e) {
             capture = { success: false, error: e?.message || String(e) };
+        }
+
+        if (capture?.captureTabId) {
+            video.captureTabId = Number(capture.captureTabId);
+            request.captureTabId = video.captureTabId;
         }
 
         if (!capture?.success || !capture.video?.url) {
@@ -1014,6 +1021,7 @@
             filename,
             videoUrl: capture.video.originalUrl || capture.video.url,
             audioUrl: capture.audio?.originalUrl || capture.audio?.url || undefined,
+            captureTabId: Number(capture.captureTabId) || Number(video.captureTabId) || 0,
             videoFormatId: capture.video.id,
             audioFormatId: capture.audio?.id
         });

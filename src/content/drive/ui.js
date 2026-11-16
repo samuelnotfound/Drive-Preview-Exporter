@@ -24,7 +24,8 @@
         bridgeReplayAt: {},
         playbackQualityHeights: [],
         playbackQualityLabels: [],
-        playbackQualityFileId: ''
+        playbackQualityFileId: '',
+        captureTabId: 0
     };
 
     app.ids = {

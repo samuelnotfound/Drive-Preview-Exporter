@@ -97,7 +97,7 @@
                 url = destination.href;
             } catch (error) {
                 if (options.signal?.aborted || error?.name === 'AbortError') throw error;
-                throw Object.assign(new Error('Drive returned a non-media response instead of a media file. Play the video and try Download again.'), { name: 'MediaTransportError' });
+                throw Object.assign(new Error('Drive returned a non-media response instead of a media file. Refresh Drive and try Export again.'), { name: 'MediaTransportError' });
             }
         }
         throw Object.assign(new Error('Drive returned too many media redirects. Try Download again.'), { name: 'MediaTransportError' });

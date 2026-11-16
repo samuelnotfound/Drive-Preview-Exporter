@@ -1,7 +1,7 @@
 /* Inspect disk-backed MP4 boxes without allocating the media payload in memory. */
 (() => {
     function invalid(label, detail) {
-        return Object.assign(new Error(`${label} is not a complete MP4 track (${detail}). Play the video and try Download again.`), { name: 'MediaValidationError' });
+        return Object.assign(new Error(`${label} is not a complete MP4 track (${detail}). Refresh Drive and try Export again.`), { name: 'MediaValidationError' });
     }
 
     async function inspect(file, label, check = () => {}) {

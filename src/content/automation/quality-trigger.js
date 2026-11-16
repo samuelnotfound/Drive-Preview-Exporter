@@ -424,7 +424,7 @@
         playbackSnapshots.delete(video);
         video.muted = previous.muted;
         video.volume = previous.volume;
-        return { ok: false, error: 'Chrome could not start the muted preview. Click Play once, then retry Export.' };
+        return { ok: false, error: 'Chrome blocked muted playback in the background Drive tab.' };
       }
       return { ok: !video.paused, wasPaused: playbackSnapshots.get(video).paused };
     },
