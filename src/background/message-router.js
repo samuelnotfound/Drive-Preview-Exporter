@@ -16,6 +16,13 @@ const invalidTabResponse = () => ({ success: false, error: 'Invalid Drive tab.' 
 const sessionChangedResponse = () => ({ success: false, error: 'The current Drive video session changed.' });
 
 async function handlePrepareVideoPlayback({ tabId }) {
+    try {
+        // Start the hidden HTML loader on Export click so it is ready to check
+        // stream URLs as soon as the Drive player exposes them.
+        await ensureVideoOffscreen();
+    } catch (error) {
+        return { ok: false, error: `Could not start the background media checker: ${error?.message || String(error)}` };
+    }
     const rows = await runQualityDom(tabId, 'prepareMutedPlayback');
     return rows.find(row => row?.value?.ok)?.value
         || rows.find(row => row?.value?.error)?.value
@@ -24,6 +31,7 @@ async function handlePrepareVideoPlayback({ tabId }) {
 
 async function handleRestoreVideoPlayback({ tabId }) {
     await runQualityDom(tabId, 'restorePlayback');
+    setTimeout(() => { void closeVideoOffscreen(); }, 1200);
     return { success: true };
 }
 
@@ -566,7 +574,24 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
                 saved = true;
                 return current;
             });
-            return saved ? { success: true, video, audio: audio?.url ? audio : null, height, label } : sessionChangedResponse();
+            if (!saved) return sessionChangedResponse();
+
+            const streamsToCheck = [{
+                label: 'video',
+                url: video.originalUrl || video.url,
+                total: Number(video.contentLength) || getStreamBytes(video.originalUrl || video.url)
+            }];
+            if (audio?.url) streamsToCheck.push({
+                label: 'audio',
+                url: audio.originalUrl || audio.url,
+                total: Number(audio.contentLength) || getStreamBytes(audio.originalUrl || audio.url)
+            });
+            const preflight = await preflightCapturedStreams(streamsToCheck);
+            if (!preflight?.success) {
+                return { success: false, error: `Background media URL check failed: ${preflight?.error || 'the stream is not available.'}` };
+            }
+
+            return { success: true, video, audio: audio?.url ? audio : null, height, label };
         } finally {
             if (probe?.token) try { await endQualityProbe(tabId, probe.token); } catch (_) {}
             try { await closePlayerMenu(tabId); } catch (_) {}

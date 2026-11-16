@@ -41,6 +41,35 @@ async function ensureVideoOffscreen() {
     return run;
 }
 
+/** Check freshly captured media URLs in the offscreen HTML document before staging a job. */
+async function preflightCapturedStreams(streams = []) {
+    await ensureVideoOffscreen();
+    try {
+        let timeout;
+        try {
+            const result = await Promise.race([
+                chrome.runtime.sendMessage({
+                    target: 'video-offscreen',
+                    type: 'videoStagePreflight',
+                    streams
+                }),
+                new Promise((_, reject) => {
+                    timeout = setTimeout(() => reject(new Error('Background media URL check timed out.')), 18000);
+                })
+            ]);
+            return result?.success
+                ? result
+                : { success: false, error: result?.error || 'The captured media URL could not be verified.' };
+        } finally {
+            clearTimeout(timeout);
+        }
+    } finally {
+        // The offscreen page is also used by active jobs; closeVideoOffscreen
+        // checks for queued jobs and pending saves before it closes anything.
+        setTimeout(() => { void closeVideoOffscreen(); }, 1200);
+    }
+}
+
 /** Close offscreen document when no jobs remain. */
 async function closeVideoOffscreen() {
     const myGen = offscreenGeneration;

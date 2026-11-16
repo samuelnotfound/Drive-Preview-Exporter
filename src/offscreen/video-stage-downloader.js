@@ -234,6 +234,73 @@
         return { total, mode: null };
     }
 
+    /** Verify captured stream URLs in the offscreen document before download UI starts. */
+    async function preflightStream(url, totalHint, label) {
+        const baseUrl = cleanStageURL(url);
+        if (!baseUrl) throw new Error(`No ${label} stream URL was captured.`);
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15000);
+        const ctx = { signal: controller.signal, markProgress: () => {} };
+        const probes = [
+            { mode: 'header', url: baseUrl, headers: { Range: 'bytes=0-0' } },
+            { mode: 'query', url: makeRangeQueryURL(baseUrl, 0, 0), headers: {} }
+        ];
+        let lastError = null;
+        try {
+            for (const probe of probes) {
+                let response = null;
+                try {
+                    response = await fetchMedia(probe.url, {
+                        credentials: 'include', cache: 'no-store',
+                        signal: controller.signal, headers: probe.headers
+                    }, ctx);
+                    if (!response.ok) throw httpError(response, `${label} URL check`);
+                    requireRawMedia(response);
+                    if (response.status !== 200 && response.status !== 206) {
+                        throw new Error(`${label} URL check returned HTTP ${response.status}.`);
+                    }
+
+                    const range = parseContentRange(response.headers.get('content-range'));
+                    const length = Number(response.headers.get('content-length')) || 0;
+                    const total = Math.max(
+                        Number(totalHint) || 0,
+                        Number(range?.total) || 0,
+                        Number(response.headers.get('content-length')) || 0
+                    );
+                    let mode = null;
+                    if (response.status === 206 && range?.start === 0 && range.end === 0) mode = probe.mode;
+                    else if (probe.mode === 'query' && response.status === 200 && total > 1 && length === 1) mode = 'query';
+
+                    try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+                    return { total, mode };
+                } catch (error) {
+                    lastError = error;
+                    try { response?.body?.cancel()?.catch?.(() => {}); } catch (_) {}
+                }
+            }
+            if (controller.signal.aborted) throw new Error(`${label} URL check timed out.`);
+            throw lastError || new Error(`${label} URL could not be verified.`);
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    async function preflightStreams(streams = []) {
+        if (!Array.isArray(streams) || !streams.length) {
+            return { success: false, error: 'No captured media URLs to check.' };
+        }
+        try {
+            const checked = await Promise.all(streams.map(async stream => ({
+                label: stream.label,
+                ...await preflightStream(stream.url, stream.total, stream.label)
+            })));
+            return { success: true, streams: checked };
+        } catch (error) {
+            return { success: false, error: error?.message || 'The captured media URL could not be verified.' };
+        }
+    }
+
     /**
      * Fetch one inclusive range. Tries the HTTP Range header first, then
      * ?range=start-end. Returns { data, total, whole } where `total` is the
@@ -891,6 +958,13 @@
             sendResponse?.({ accepted: true });
             void run(message.jobId);
             return;
+        }
+        if (message.type === 'videoStagePreflight') {
+            void preflightStreams(message.streams).then(
+                result => sendResponse?.(result),
+                error => sendResponse?.({ success: false, error: error?.message || String(error) })
+            );
+            return true;
         }
         if (message.type === 'videoStageCancelInternal') cancel(message.jobId);
         if (message.type === 'videoStageRestartInternal') restart(message.jobId);

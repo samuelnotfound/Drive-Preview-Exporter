@@ -970,7 +970,7 @@
             || (height ? `${height}p` : '')
         ).trim();
 
-        const veilMsg = `Preparing ${label || (height ? height + 'p' : 'export')}…`;
+        const veilMsg = `Preparing ${label || (height ? height + 'p' : 'export')}… checking stream in background`;
         status.textContent = veilMsg;
         app.ui.closeDriveFileMenu();
 
