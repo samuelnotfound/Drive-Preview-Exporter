@@ -11,7 +11,7 @@ const source = fs.readFileSync(path.join(__dirname, '../src/offscreen/video-stag
 const abortError = () => Object.assign(new Error('Aborted'), {name:'AbortError'});
 function deferred() { let resolve; const promise=new Promise(done => { resolve=done; }); return {promise,resolve}; }
 
-function harness({job={}, fetch, createStream}={}) {
+function harness({job={}, fetch, createStream, refresh}={}) {
     job={jobId:'test-job', mode:'single', mediaUrl:'https://example.com/video', videoUrl:'https://example.com/video', audioUrl:'https://example.com/audio', ...job};
     let listener;
     const done=deferred();
@@ -47,11 +47,12 @@ function harness({job={}, fetch, createStream}={}) {
         sendMessage(message,callback) {
             if (callback) { callback({job}); return; }
             messages.push(message);
+            if (message.type === 'refreshVideoStageStreams') return Promise.resolve(refresh ? refresh(message) : {success:false});
             if (['videoStageError','videoStageCancelled'].includes(message.type)) done.resolve(message);
             return Promise.resolve();
         }
     }};
-    vm.runInNewContext(shared + '\n' + media + '\n' + source,{window,chrome,fetch,URL,Blob,Uint8Array,AbortController,performance,setTimeout,clearTimeout,setInterval,clearInterval});
+    vm.runInNewContext(shared + '\n' + media + '\n' + source,{window,chrome,fetch,URL,Blob,Uint8Array,TextDecoder,AbortController,performance,setTimeout,clearTimeout,setInterval,clearInterval});
     function send(type) { listener({target:'video-offscreen',type,jobId:job.jobId},null,()=>{}); }
     return {start() { send('videoStageStart'); return done.promise; },cancel() { send('videoStageCancelInternal'); },restart() { send('videoStageRestartInternal'); },messages,disks,get removed() {return removed;}};
 }
@@ -229,4 +230,41 @@ test('wrong-kind and mismatched-duration tracks are rejected before merging', {t
         assert.equal((await h.start()).type,'videoStageError');
         assert.equal(h.messages.some(m=>m.type==='videoStageSourcesReady'),false);
     }
+});
+
+test('a non-media header probe falls back to a valid query request', {timeout:3000}, async()=>{
+    const bytes=mp4();
+    const h=harness({job:{mediaBytes:bytes.length},fetch:async(url,options)=>{
+        if(options.headers?.Range)return new Response('<html>temporary failure</html>',{headers:{'content-type':'text/html'}});
+        const range=new URL(url).searchParams.get('range').split('-').map(Number);
+        return new Response(bytes.subarray(range[0],range[1]+1),{headers:{'content-type':'video/mp4','content-length':String(range[1]-range[0]+1)}});
+    }});
+    assert.equal((await h.start()).type,'saved');assert.equal(h.messages.some(m=>m.type==='refreshVideoStageStreams'),false);
+});
+test('a trusted text media redirect is followed without counting it as downloaded bytes', {timeout:3000}, async()=>{
+    const bytes=mp4();let redirects=0;
+    const h=harness({job:{mediaUrl:'https://source.googlevideo.com/videoplayback',mediaBytes:bytes.length},fetch:async(url,options)=>{
+        if(new URL(url).hostname==='source.googlevideo.com'){redirects++;return new Response('https://destination.googlevideo.com/videoplayback',{headers:{'content-type':'text/plain'}});}
+        const match=/bytes=(\d+)-(\d+)/.exec(options.headers.Range);const start=Number(match[1]),end=Number(match[2]);
+        return new Response(bytes.subarray(start,end+1),{status:206,headers:{'content-type':'video/mp4','content-range':'bytes '+start+'-'+end+'/'+bytes.length}});
+    }});
+    assert.equal((await h.start()).type,'saved');assert.ok(redirects>0);
+    assert.ok(h.messages.filter(m=>m.type==='videoStageProgress').every(m=>m.received<=bytes.length));
+});
+test('text bodies cannot redirect the downloader to an unrelated host', {timeout:3000}, async()=>{
+    let unrelated=0;const h=harness({fetch:async(url)=>{if(url.includes('unrelated.example'))unrelated++;return new Response('https://unrelated.example/videoplayback',{headers:{'content-type':'text/plain'}});}});
+    assert.equal((await h.start()).type,'videoStageError');assert.equal(unrelated,0);
+});
+test('a failed source is recaptured once and can finish without a page refresh', {timeout:3000}, async()=>{
+    const bytes=mp4();let refreshes=0;
+    const h=harness({job:{mode:'adaptive',videoBytes:bytes.length,audioBytes:bytes.length},refresh:()=>{refreshes++;return {success:true,videoUrl:'https://example.com/fresh-video',audioUrl:'https://example.com/fresh-audio',videoBytes:bytes.length,audioBytes:bytes.length};},fetch:async(url,options)=>{
+        if(!url.includes('/fresh-'))return new Response('<html>expired source</html>',{headers:{'content-type':'text/html'}});
+        if(options.headers)return new Response(null,{status:400});
+        return new Response(url.includes('audio')?mp4({kind:'audio'}):bytes);
+    }});
+    const result=await h.start();assert.equal(result.type,'saved');assert.ok(refreshes>=1&&refreshes<=2);
+});
+test('persistent non-media responses stop after one recapture per stream', {timeout:3000}, async()=>{
+    let refreshes=0;const h=harness({refresh:()=>{refreshes++;return {success:true,videoUrl:'https://example.com/still-invalid'};},fetch:async()=>new Response('<html>still invalid</html>',{headers:{'content-type':'text/html'}})});
+    assert.equal((await h.start()).type,'videoStageError');assert.equal(refreshes,1);assert.equal(h.messages.some(m=>m.type==='videoStageSourcesReady'),false);
 });

@@ -467,6 +467,7 @@ async function handleListPlayerQualityLabels({ request, tabId }) {
  * 5. Returns both streams ready for download.
  */
 async function handleCaptureQualityForDownload({ request, tabId }) {
+    const forceFresh = request.forceFresh === true;
     const height = Number(request.qualityHeight || request.height || 0);
     const label = String(request.qualityLabel || request.label || (height ? `${height}p` : '')).trim();
     if (!height && !label) {
@@ -522,7 +523,7 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
             let video = null;
             try {
                 // Wait for network capture matching probe
-                video = await waitForQualityStream(tabId, probe.token, height, (typeof FAST_SCAN !== "undefined" ? FAST_SCAN.streamWaitMs : 1500), new Set(), clickAt);
+                video = await waitForQualityStream(tabId, probe.token, height, (forceFresh ? 6000 : (typeof FAST_SCAN !== "undefined" ? FAST_SCAN.streamWaitMs : 1500)), new Set(), clickAt);
                 if (!video?.url) {
                     const recentAfter = (streamCaptureState(tabId)?.recentStreams || [])
                         .filter(s => s?.url && !isAudioStream(s) && Number(s.capturedAt || 0) >= clickAt - 50)
@@ -530,11 +531,11 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
                     video = recentAfter[0] || null;
                 }
                 // Fallback to already playing stream if Drive didn't fire a new request
-                if (!video?.url && alreadyPlaying?.url) {
+                if (!forceFresh && !video?.url && alreadyPlaying?.url) {
                     video = alreadyPlaying;
                 }
-                // Final fallback to session video
-                if (!video?.url) {
+                // Recovery must not silently reuse the stale source that just failed.
+                if (!forceFresh && !video?.url) {
                     const session = await getStoredSession(tabId);
                     if (session?.video) {
                         const h = Number(
@@ -595,10 +596,10 @@ async function handleCaptureQualityForDownload({ request, tabId }) {
                 .filter(s => s?.url && isAudioStream(s))
                 .sort((a, b) => Number(b.capturedAt || 0) - Number(a.capturedAt || 0));
             const audioAfterClick = recentAudio.find(s => Number(s.capturedAt || 0) >= clickAt - 50) || null;
-            let audio = audioAfterClick
+            let audio = forceFresh ? audioAfterClick : (audioAfterClick
                 || recentAudio[0]
                 || await getCurrentSessionAudioCandidate(tabId)
-                || (typeof getGlobalLastAudio === 'function' ? getGlobalLastAudio() : null);
+                || (typeof getGlobalLastAudio === 'function' ? getGlobalLastAudio() : null));
             if (audio?.url) {
                 audio = {
                     ...audio,
@@ -1028,7 +1029,8 @@ const ACTION_HANDLERS = Object.freeze({
  * Map of handlers keyed by `request.type`.
  */
 const TYPE_HANDLERS = Object.freeze({
-    getVideoStageJob: handleGetVideoStageJob
+    getVideoStageJob: handleGetVideoStageJob,
+    refreshVideoStageStreams
 });
 
 /**

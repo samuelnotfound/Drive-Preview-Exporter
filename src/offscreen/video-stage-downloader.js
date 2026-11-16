@@ -81,6 +81,28 @@
         });
     }
 
+    // Some media endpoints return an HTTPS media redirect as a small text body.
+    // Follow only Google's media hosts, with a strict size and redirect bound.
+    async function fetchMedia(url, options, ctx) {
+        for (let redirects = 0; redirects < 3; redirects++) {
+            const response = await fetch(url, options);
+            ctx.markProgress();
+            if (!response.ok || !/^text\/plain(?:;|$)/i.test(response.headers.get('content-type') || '')) return response;
+            try {
+                const bytes = await readBody(response, () => ctx.markProgress(), 8192);
+                const destination = new URL(new TextDecoder().decode(bytes).trim());
+                if (destination.protocol !== 'https:' || destination.username || destination.password
+                    || !/(^|\.)(?:googlevideo|googleusercontent)\.com$/.test(destination.hostname)
+                    || destination.pathname !== '/videoplayback') throw new Error('Not a media redirect');
+                url = destination.href;
+            } catch (error) {
+                if (options.signal?.aborted || error?.name === 'AbortError') throw error;
+                throw Object.assign(new Error('Drive returned a non-media response instead of a media file. Play the video and try Download again.'), { name: 'MediaTransportError' });
+            }
+        }
+        throw Object.assign(new Error('Drive returned too many media redirects. Try Download again.'), { name: 'MediaTransportError' });
+    }
+
     function rangeUnsupported(message) {
         return Object.assign(new Error(message), { name: 'RangeUnsupportedError' });
     }
@@ -163,12 +185,12 @@
 
         for (const probe of probes) {
             try {
-                const response = await fetch(probe.url, {
+                const response = await fetchMedia(probe.url, {
                     credentials: 'include',
                     cache: 'no-store',
                     signal: ctx.signal,
                     headers: probe.headers
-                });
+                }, ctx);
                 ctx.markProgress();
                 requireRawMedia(response);
                 const range = parseContentRange(response.headers.get('content-range'));
@@ -199,7 +221,7 @@
                 }
                 try { response.body?.cancel()?.catch?.(() => {}); } catch (_) {}
             } catch (err) {
-                if (ctx.signal.aborted || err?.name === 'AbortError' || err?.name === 'MediaTransportError') throw err;
+                if (ctx.signal.aborted || err?.name === 'AbortError') throw err;
             }
         }
         return { total, mode: null };
@@ -214,7 +236,7 @@
         const attempts = [
             { mode: 'header', url: baseUrl, headers: { Range: `bytes=${start}-${end}` } },
             { mode: 'query', url: makeRangeQueryURL(baseUrl, start, end), headers: {} }
-        ].filter(attempt => !ctx.rangeMode || attempt.mode === ctx.rangeMode);
+        ].sort((a, b) => Number(b.mode === ctx.rangeMode) - Number(a.mode === ctx.rangeMode));
 
         let lastError = null;
         for (const attempt of attempts) {
@@ -223,12 +245,12 @@
                 let inflight = 0;
                 const onBytes = n => { inflight += n; ctx.markProgress(); ctx.report(inflight); };
 
-                const response = await fetch(attempt.url, {
+                const response = await fetchMedia(attempt.url, {
                     credentials: 'include',
                     cache: 'no-store',
                     signal: ctx.signal,
                     headers: attempt.headers
-                });
+                }, ctx);
                 ctx.markProgress();
                 requireRawMedia(response);
 
@@ -283,7 +305,9 @@
                 return { data: body, total: range?.total || 0, whole: false };
             } catch (err) {
                 if (err?.name === 'AbortError') throw err;
-                if (err?.name === 'RangeUnsupportedError' || err?.name === 'MediaTransportError') throw err;
+                // A failed header request can still have a valid query-range response.
+                // Try the other request form before refreshing the captured source.
+                if (err?.name === 'RangeUnsupportedError' && attempt === attempts[attempts.length - 1]) throw err;
                 lastError = err;
             } finally {
                 // Clear the current attempt's in-flight bytes on failure or
@@ -300,7 +324,7 @@
             try {
                 return await fetchRange(baseUrl, start, end, ctx, label);
             } catch (err) {
-                if (err?.name === 'AbortError' || err?.name === 'RangeUnsupportedError' || err?.name === 'MediaTransportError'
+                if (err?.name === 'AbortError' || err?.name === 'RangeUnsupportedError'
                     || cancelledJobs.has(ctx.jobId)) throw err;
                 lastError = err;
                 if (i + 1 < CHUNK_RETRIES) {
@@ -316,9 +340,9 @@
         // Without ranges an interrupted transfer must start at byte zero.
         await st.disk.reset();
         st.bytes = 0;
-        const response = await fetch(baseUrl, {
+        const response = await fetchMedia(baseUrl, {
             credentials: 'include', cache: 'no-store', signal: ctx.signal
-        });
+        }, ctx);
         requireRawMedia(response);
         if (!response.ok) throw new Error(`${label} download failed (${response.status})`);
         const declared = Number(response.headers.get('content-length')) || 0;
@@ -340,7 +364,7 @@
         }
         const expected = Math.max(st.total, declared);
         if (!st.bytes || st.bytes < expected || (declared && st.bytes !== declared)) {
-            throw new Error(`${label} download incomplete (${st.bytes} of ${expected} bytes)`);
+            throw Object.assign(new Error(`${label} download incomplete (${st.bytes} of ${expected} bytes)`), { name: 'IncompleteStreamError' });
         }
         st.total = st.bytes;
         ctx.report(0, true);
@@ -620,7 +644,7 @@
      */
     async function downloadStream(url, totalHint, label, job, parentSignal, rt) {
         const jobId = job.jobId;
-        const baseUrl = cleanStageURL(url);
+        let baseUrl = cleanStageURL(url);
         const st = {
             bytes: 0, total: Math.max(0, Number(totalHint) || 0),
             probed: false, rangeMode: null, parallelChunks: null,
@@ -628,6 +652,7 @@
         };
         const report = makeReporter(jobId, label, st);
         let autoRestarts = 0;
+        let sourceRefreshes = 0;
 
         try {
             for (;;) {
@@ -665,6 +690,32 @@
                             jobId, stage: 'download', message: `Restarting ${label} download…`
                         });
                         continue;
+                    }
+                    if (sourceRefreshes < 1 && ['MediaTransportError', 'IncompleteStreamError', 'MediaValidationError'].includes(err?.name)) {
+                        sourceRefreshes++;
+                        postStageMessage('videoStageStatus', {
+                            jobId, stage: 'download', message: 'Capturing fresh stream URLs…'
+                        });
+                        try {
+                            const fresh = await chrome.runtime.sendMessage({ type: 'refreshVideoStageStreams', jobId });
+                            throwIfCancelled(jobId);
+                            if (parentSignal.aborted) throw abortError();
+                            const nextUrl = fresh?.[label === 'audio' ? 'audioUrl' : 'videoUrl'];
+                            if (!fresh?.success || !nextUrl) throw err;
+                            await st.disk.abort();
+                            st.disk = await window.GDriveVideoDiskStorage.createStream(jobId, label);
+                            st.bytes = 0;
+                            st.total = Math.max(0, Number(fresh[label === 'audio' ? 'audioBytes' : 'videoBytes']) || st.total);
+                            st.parallelChunks = null;
+                            st.probed = false;
+                            st.rangeMode = null;
+                            baseUrl = cleanStageURL(nextUrl);
+                            report(0, true);
+                            continue;
+                        } catch (refreshError) {
+                            if (cancelledJobs.has(jobId) || parentSignal.aborted) throw abortError();
+                            throw err;
+                        }
                     }
                     if (attempt.stuck) {
                         if (autoRestarts < MAX_STUCK_RESTARTS) {
