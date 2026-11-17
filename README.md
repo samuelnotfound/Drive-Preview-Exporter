@@ -15,7 +15,7 @@ Choose the version that suits what you need:
 | PDF previews | Yes | Yes |
 | Video previews | **No** | Yes |
 | Best for | Quickly saving a PDF | Regular PDF and video exports |
-| Get started | [Open the bookmarklet page](https://samuelnotfound.github.io/Drive-Preview-Exporter/) | [Install the extension](#install-the-extension) |
+| Get started | [Open the bookmarklet page](https://samuelnotfound.github.io/Drive-Preview-Exporter/) | [Install the extension](#option-2-install-the-chrome-extension) |
 
 > **Legal Disclaimer:** This tool is provided strictly for educational purposes and personal use. Users are entirely responsible for ensuring they have the legal right to save or export any content and must comply with Google Drive's Terms of Service. The creator of this repository assumes no liability for how this tool is used, nor any consequences resulting from its use.
 
