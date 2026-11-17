@@ -55,7 +55,7 @@ The bookmarklet is the quickest option when you only need PDFs. It does not requ
 
 ## How to use it
 
-#### Export a PDF
+### Export a PDF
 
 #### Option 1: Using Bookmarklet
 1. Open the PDF in Google Drive.
