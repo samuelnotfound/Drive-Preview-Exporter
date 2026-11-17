@@ -1,86 +1,102 @@
-# Drive Preview Exporter
+<div align="center">
+  <h1>Drive Preview Exporter</h1>
+  <p>A Chrome extension for exporting PDF and video previews you can already access in Google Drive, and a lightweight bookmarklet for standalone PDF export.</p>
+  <p>
+    <a href="https://github.com/samuelnotfound/Drive-Preview-Exporter"><img src="https://img.shields.io/github/stars/samuelnotfound/Drive-Preview-Exporter?style=for-the-badge&color=8B9CF6" alt="GitHub stars"></a>
+    <img src="https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Chrome Manifest V3">
+  </p>
+</div>
 
-**This does not remove permissions or bypass account restrictions.**
+Choose the version that suits what you need:
 
-> [!WARNING]
+| | **PDF bookmarklet** | **Chrome extension** |
+|---|---|---|
+| Install required | No | Yes |
+| PDF previews | Yes | Yes |
+| Video previews | **No** | Yes |
+| Best for | Quickly saving a PDF | Regular PDF and video exports |
+| Get started | [Open the bookmarklet page](https://samuelnotfound.github.io/Drive-Preview-Exporter/) | [Install the extension](#install-the-extension) |
+
 > **Legal Disclaimer:** This tool is provided strictly for educational purposes and personal use. Users are entirely responsible for ensuring they have the legal right to save or export any content and must comply with Google Drive's Terms of Service. The creator of this repository assumes no liability for how this tool is used, nor any consequences resulting from its use.
 
+## What can it do?
 
-## Features
-- **FASTER** download compared to other similar extension
-- Automatically injects an **Export** button to the File menu when Google Drive’s or Google Docs' normal download option is disabled
-- Saves **view-only PDF** and **video** previews as local files
-- Also available as a **PDF-only bookmarklet** (no extension install needed)
-- Processes PDF pages and video streams **locally in the browser**
-
-## How does it work?
-
-### PDF
-
-The extension captures each page as it is rendered in the Google Drive/Google Doc's viewer, then builds an exportable PDF from those page images.
-
-### Video
-
-Google Drive serves video and audio as separate streams to the video player. The extension detects those streams, exports them, and merges them into a single MP4 file.
+- **FASTER** download compared to other similar extensions.
+- **Export PDF previews** — captures the pages rendered in the Google Drive or Google Docs viewer and assembles them into a PDF.
+- **Export Drive video previews** — detects the audio and video streams made available to the Drive player and combines compatible streams into an MP4.
+- **Add an Export option to the interface** — places an export entry in the relevant Google file menu when the normal download option is unavailable.
+- **Work without a server-side conversion step** — PDF capture and video processing are handled in the browser.
+- **Use the bookmarklet for PDFs** — save a PDF preview without installing the full extension.
 
 Support for additional file types is currently unplanned.
 
-## Installation
-### Bookmarklet (Easiest)
+## Get started
 
-**No extension install needed.** Works for **PDFs only**. This is the easier and faster way when you only need to save some PDFs.
+### Option 1: Use the PDF bookmarklet
 
-Open **[this link](https://samuelnotfound.github.io/Drive-Preview-Exporter/)** and follow the instructions.
+The bookmarklet is the quickest option when you only need PDFs. It does not require installing the extension.
 
-### Extension
+1. Open the [Drive Preview Exporter bookmarklet page](https://samuelnotfound.github.io/Drive-Preview-Exporter/).
+2. Follow the page's instructions to add **Drive PDF Export** to your bookmarks bar.
+3. Open a PDF preview in Google Drive or Google Docs.
+4. Select **Drive PDF Export** from your bookmarks bar and follow the on-screen steps.
 
-1. Download the latest release ZIP **or** clone/download this repository, then unpack it.
-2. Open `chrome://extensions`.
-3. Enable **Developer mode**.
-4. Click **Load unpacked** and select the extension folder.
+**Bookmarklet note:** This option is for PDF previews only. Use the extension for video exports.
 
-Keep only one copy enabled in Chrome. Loading a second unpacked folder creates
-a separate extension, and both copies can interfere with the same page controls
-and progress overlay.
+### Option 2: Install the Chrome extension
 
+1. [Download the repository as a ZIP](https://github.com/samuelnotfound/Drive-Preview-Exporter/archive/refs/heads/main.zip).
+2. Extract the ZIP file somewhere easy to find. Keep the extracted folder in place after installation.
+3. Open `chrome://extensions` in Chrome.
+4. Turn on **Developer mode**.
+5. Select **Load unpacked**.
+6. Choose the extracted **Drive-Preview-Exporter** folder — the folder containing `manifest.json`.
+7. The extension should now appear in your extensions list.
 
-## Usage 
+## How to use it
 
-### Bookmarklet
+#### Export a PDF
 
-1. Open a view-only PDF on Google Drive/Google Docs.
-2. Click "Drive PDF Export" in the bookmarks tab.
+#### Option 1: Using Bookmarklet
+1. Open the PDF in Google Drive.
+2. Click the bookmark **"Drive PDF Export"**.
 
-When updating the bookmarklet, replace your saved bookmark with the button from
-the latest installer page. Saved bookmarks do not update automatically.
-
-### Extension
-
-1. Open a view-only PDF or video on Google Drive/Google Docs.
+#### Option 2: Using Extension
+1. Open the PDF in Google Drive or Google Docs.
 2. Open the **File** menu.
-3. Choose the extension’s **Export** item.
-4. Follow the on-screen overlay (capture / quality picker / progress).
+3. Select the extension's **Export** option, or use the bookmarklet if you installed that version.
+4. Follow the capture instructions and let the process finish.
+5. Save the generated PDF when prompted.
 
-For files opened through Google Classroom, the **"Export"** menu might work but it is not polished and breaks sometimes. It is recommended to use **File → Open → Open in new tab** first, then use the Google Drive **File** menu.
+### Export a video
 
+1. Open and play the video preview in Google Drive.
+2. Open the **File** menu and choose the extension's **Export** option.
+3. Follow the on-screen prompts, including the available quality choice.
+4. Keep the tab open while the video is being processed.
+5. Save the resulting MP4 when the export completes.
 
-## Known Issues
+## How it works
 
-* PDF quality may appear blurry — Zoom the document to 200% or higher before capturing it for better quality.
-* PDF capture may not complete — Do not close or leave the current tab while a capture is in progress.
-* Video exports may be extremely slow or fail — Refresh the current tab and try the export again (and again).
+### PDF previews
 
-For other unexpected problems, refreshing the current tab usually resolves them.
+The extension captures each page as it appears in the document viewer, then assembles those captures into a PDF in the browser.
 
-This is an experimental program and, like many experimental projects, it may still contain bugs and unexpected behavior. This application is provided as-is.
+### Video previews
 
-## Limitations
+Google Drive's player can receive audio and video as separate streams. The extension detects the streams available to the player and combines compatible streams into one MP4 file. The bundled `mp4-remux` library is used for the remuxing step, without re-encoding the media.
 
-- PDF quality depends on the resolution Google Drive renders in the viewer.
-- Large files can use significant memory and take longer to process.
-- Video quality is limited to the streams and resolutions Drive actually exposes.
-- Changes to Google Drive’s player, viewer, or network behavior may break compatibility.
-- Leaving the PDF viewer tab mid-capture can still interrupt page capture.
+## Troubleshooting
+
+| Problem | Things to try |
+|---|---|
+| The PDF looks blurry | Increase the viewer zoom to 200% or higher, then start the capture again. |
+| PDF capture stops or does not finish | Keep the Google Drive/Docs tab open and in the foreground until capture completes. |
+| Video export is slow or fails | Refresh the video tab and try again. Some videos or stream combinations may not be exportable. |
+| Export does not appear in the menu | Refresh the page and reopen the File menu. Make sure the extension is enabled. |
+| A Classroom file does not work | Open the attachment in a new tab, then use the Drive/Docs page instead of the Classroom preview. |
+
+Still stuck? [Open an issue](https://github.com/samuelnotfound/Drive-Preview-Exporter/issues) and include your browser version, whether you were exporting a PDF or video, and the steps that caused the problem. Remove private file links and personal information from screenshots or logs.
 
 ## Credits
 
